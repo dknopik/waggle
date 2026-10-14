@@ -24,16 +24,16 @@ use std::{
     task::{Context, Poll},
 };
 
-use async_channel::{Receiver, unbounded};
-use futures::{
-    StreamExt,
-    stream::{FuturesUnordered, SelectAll},
-};
-use libp2p::swarm::{
-    ConnectionHandler, ConnectionHandlerEvent,
-    handler::{
-        ConnectionEvent, DialUpgradeError, FullyNegotiatedInbound, FullyNegotiatedOutbound,
-        StreamUpgradeError, SubstreamProtocol,
+use async_channel::{Sender, unbounded};
+use futures::{StreamExt, stream::FuturesUnordered};
+use libp2p::{
+    PeerId,
+    swarm::{
+        ConnectionHandler, ConnectionHandlerEvent, ConnectionId,
+        handler::{
+            ConnectionEvent, DialUpgradeError, FullyNegotiatedInbound, FullyNegotiatedOutbound,
+            StreamUpgradeError, SubstreamProtocol,
+        },
     },
 };
 
@@ -49,12 +49,12 @@ use crate::{
 pub enum HandlerIn {
     /// Subscribe to a topic on this connection.
     ///
-    /// `close_signal` is this connection's receiver clone of the topic's
-    /// close signal; it is handed to the subscription stream so the stream
-    /// closes when the topic is unsubscribed.
+    /// `sender` is a clone of the sending half of the topic's channel; the
+    /// subscription stream delivers its [`TopicEvent`]s on it, and closes
+    /// when the channel closes.
     Subscribe {
         topic_id: Vec<u8>,
-        close_signal: Receiver<()>,
+        sender: Sender<TopicEvent>,
     },
 }
 
@@ -67,15 +67,43 @@ pub enum Event {
         topic_id: Vec<u8>,
         sender: PieceSender,
     },
-    /// A message with object pieces was received.
-    Received {
-        topic_id: Vec<u8>,
-        pieces: ObjectPieces,
-    },
     /// The remote peer's subscription ended: the remote closed the stream,
     /// an error occurred, the connection closed, or every `sender` was
     /// dropped.
     Unsubscribed { topic_id: Vec<u8> },
+}
+
+/// A message on the channel of a topic we subscribed to.
+///
+/// Each of our subscription streams, one per connection to a peer, delivers
+/// an `Opened`, then the pieces the peer sends on the topic, then a
+/// `Closed`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TopicEvent {
+    /// Our subscription stream to a peer was established.
+    Opened {
+        /// The peer we subscribed to.
+        peer_id: PeerId,
+        /// The connection the stream is on.
+        connection_id: ConnectionId,
+    },
+    /// A peer sent pieces on the topic.
+    Pieces {
+        /// The peer that sent the pieces.
+        peer_id: PeerId,
+        /// The connection the stream is on.
+        connection_id: ConnectionId,
+        /// The pieces.
+        pieces: ObjectPieces,
+    },
+    /// Our subscription stream to a peer ended: the peer closed it, the
+    /// stream failed, or the connection closed. No more pieces arrive on it.
+    Closed {
+        /// The peer we subscribed to.
+        peer_id: PeerId,
+        /// The connection the stream was on.
+        connection_id: ConnectionId,
+    },
 }
 
 /// A set of object pieces of one object, exchanged with a peer on a topic.
@@ -110,39 +138,46 @@ impl From<ObjectPieces> for proto::ObjectPieces {
 ///
 /// Manages the topic subscription streams on one connection: the receive
 /// streams of the topics we subscribed to, and the send streams of the
-/// topics the remote peer subscribed to. The send streams are wired directly
-/// to the senders handed to the application. Delivers events to the
-/// behaviour and enforces the inbound stream limit.
+/// topics the remote peer subscribed to. Each stream is wired directly to a
+/// channel handed to the application. Delivers events to the behaviour and
+/// enforces the inbound stream limit.
 pub struct Handler {
     /// Configuration for limits, queue sizes, and wire sizes.
     config: Config,
+    /// The remote peer of the connection.
+    peer_id: PeerId,
+    /// The connection the handler manages.
+    connection_id: ConnectionId,
     /// Negotiates inbound substreams and enforces the inbound stream limit.
     inbound_protocol: InboundProtocol,
     /// The receive streams of the topics we subscribed to on this connection.
-    outbound_substreams: SelectAll<Outbound>,
+    outbound_substreams: FuturesUnordered<Outbound>,
     /// The topics the remote peer subscribed to on this connection.
     inbound_subscriptions: HashSet<Vec<u8>>,
     /// The send streams for the topics the remote peer subscribed to.
     inbound_substreams: FuturesUnordered<Inbound>,
     /// The connection events to deliver to the swarm, drained in `poll`.
-    pending_events: VecDeque<ConnectionHandlerEvent<OutboundProtocol, Receiver<()>, Event>>,
+    pending_events: VecDeque<ConnectionHandlerEvent<OutboundProtocol, Sender<TopicEvent>, Event>>,
     /// The per-connection outbound counter, shared with the senders and the
     /// stream writers.
     used: Arc<AtomicUsize>,
 }
 
 impl Handler {
-    /// Creates a new `Handler` for one connection.
+    /// Creates a new `Handler` for the connection `connection_id` to
+    /// `peer_id`.
     ///
     /// `config` holds the limits, queue sizes, and wire sizes.
-    pub(crate) fn new(config: Config) -> Self {
+    pub(crate) fn new(config: Config, peer_id: PeerId, connection_id: ConnectionId) -> Self {
         Self {
             inbound_protocol: InboundProtocol::new(
                 config.max_protobuf_size(),
                 config.max_topic_subscription(),
             ),
             config,
-            outbound_substreams: SelectAll::new(),
+            peer_id,
+            connection_id,
+            outbound_substreams: FuturesUnordered::new(),
             inbound_subscriptions: HashSet::new(),
             inbound_substreams: FuturesUnordered::new(),
             pending_events: VecDeque::new(),
@@ -157,7 +192,7 @@ impl ConnectionHandler for Handler {
     type InboundProtocol = InboundProtocol;
     type OutboundProtocol = OutboundProtocol;
     type InboundOpenInfo = ();
-    type OutboundOpenInfo = Receiver<()>;
+    type OutboundOpenInfo = Sender<TopicEvent>;
 
     fn listen_protocol(&self) -> SubstreamProtocol<Self::InboundProtocol> {
         SubstreamProtocol::new(self.inbound_protocol.clone(), ())
@@ -165,10 +200,7 @@ impl ConnectionHandler for Handler {
 
     fn on_behaviour_event(&mut self, hin: HandlerIn) {
         match hin {
-            HandlerIn::Subscribe {
-                topic_id,
-                close_signal,
-            } => {
+            HandlerIn::Subscribe { topic_id, sender } => {
                 self.pending_events
                     .push_back(ConnectionHandlerEvent::OutboundSubstreamRequest {
                         protocol: SubstreamProtocol::new(
@@ -176,7 +208,7 @@ impl ConnectionHandler for Handler {
                                 max_protobuf_size: self.config.max_protobuf_size(),
                                 topic_id,
                             },
-                            close_signal,
+                            sender,
                         ),
                     });
             }
@@ -186,16 +218,16 @@ impl ConnectionHandler for Handler {
     fn poll(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<ConnectionHandlerEvent<Self::OutboundProtocol, Receiver<()>, Self::ToBehaviour>> {
+    ) -> Poll<ConnectionHandlerEvent<Self::OutboundProtocol, Sender<TopicEvent>, Self::ToBehaviour>>
+    {
         // Process the pending events first.
         if let Some(event) = self.pending_events.pop_front() {
             return Poll::Ready(event);
         }
 
-        // Then process the receive streams of the topics we subscribed to.
-        if let Poll::Ready(Some(event)) = self.outbound_substreams.poll_next_unpin(cx) {
-            return Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(event));
-        }
+        // Then drive the receive streams of the topics we subscribed to,
+        // dropping the ones that completed.
+        while let Poll::Ready(Some(())) = self.outbound_substreams.poll_next_unpin(cx) {}
 
         // Then drive the send streams of the topics the remote subscribed to,
         // dropping the ones that completed.
@@ -219,6 +251,10 @@ impl ConnectionHandler for Handler {
             .extend(self.inbound_subscriptions.drain().map(|topic_id| {
                 ConnectionHandlerEvent::NotifyBehaviour(Event::Unsubscribed { topic_id })
             }));
+        // Our subscriptions end with the connection too.
+        for outbound in std::mem::take(&mut self.outbound_substreams) {
+            outbound.close();
+        }
 
         while let Some(event) = self.pending_events.pop_front() {
             if let ConnectionHandlerEvent::NotifyBehaviour(event) = event {
@@ -286,13 +322,19 @@ impl ConnectionHandler for Handler {
             }
             ConnectionEvent::FullyNegotiatedOutbound(FullyNegotiatedOutbound {
                 protocol: (topic_id, substream),
-                info: close_signal,
+                info: sender,
             }) => {
-                // We subscribed to this topic: set up the stream we receive
-                // the topic's pieces on, and signal the behaviour so it can
-                // close the stream if the topic is unsubscribed.
-                let outbound = Outbound::new(topic_id.clone(), substream, close_signal);
-                self.outbound_substreams.push(outbound);
+                // We subscribed to this topic: forward what we receive on the
+                // stream to the topic's channel. If the topic was
+                // unsubscribed in the meantime, the channel is closed and the
+                // stream closes right away.
+                self.outbound_substreams.push(Outbound::new(
+                    topic_id,
+                    self.peer_id,
+                    self.connection_id,
+                    substream,
+                    sender,
+                ));
             }
             ConnectionEvent::DialUpgradeError(DialUpgradeError {
                 error: StreamUpgradeError::NegotiationFailed,

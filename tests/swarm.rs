@@ -1,5 +1,6 @@
 //! End-to-end tests through the public API: real swarms connected over the
-//! memory transport, exchanging pieces with the application.
+//! memory transport, exchanging pieces on the channels handed to the
+//! application.
 
 use std::time::Duration;
 
@@ -15,7 +16,7 @@ use libp2p::{
 use waggle::{
     behaviour::{Behaviour, Event},
     config::Config,
-    handler::{ObjectPieces, PieceSender, SendError},
+    handler::{ObjectPieces, PieceSender, SendError, TopicEvent},
 };
 
 const TOPIC: &[u8] = b"topic";
@@ -24,7 +25,8 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 /// Instructions for a node's swarm task.
 enum Command {
     Dial(Multiaddr),
-    Subscribe,
+    /// Subscribes to [`TOPIC`], replying with the topic's receiver.
+    Subscribe(Sender<Receiver<TopicEvent>>),
     Unsubscribe,
     Disconnect(PeerId),
 }
@@ -36,6 +38,8 @@ struct Node {
     addr: Multiaddr,
     commands: Sender<Command>,
     events: Receiver<Event>,
+    /// The receiver of [`TOPIC`]'s events.
+    topic: Option<Receiver<TopicEvent>>,
 }
 
 impl Node {
@@ -60,7 +64,7 @@ impl Node {
             .parse()
             .unwrap();
         swarm.listen_on(addr.clone()).unwrap();
-        swarm.behaviour_mut().subscribe(TOPIC.to_vec());
+        let topic = swarm.behaviour_mut().subscribe(TOPIC.to_vec());
 
         let (commands, command_rx) = async_channel::unbounded();
         let (event_tx, events) = async_channel::unbounded();
@@ -69,9 +73,9 @@ impl Node {
                 tokio::select! {
                     command = command_rx.recv() => match command {
                         Ok(Command::Dial(addr)) => swarm.dial(addr).unwrap(),
-                        Ok(Command::Subscribe) => {
-                            let subscribed = swarm.behaviour_mut().subscribe(TOPIC.to_vec());
-                            assert!(subscribed, "already subscribed");
+                        Ok(Command::Subscribe(reply)) => {
+                            let topic = swarm.behaviour_mut().subscribe(TOPIC.to_vec());
+                            let _ = reply.try_send(topic.expect("already subscribed"));
                         }
                         Ok(Command::Unsubscribe) => {
                             swarm.behaviour_mut().unsubscribe(TOPIC.to_vec());
@@ -95,6 +99,7 @@ impl Node {
             addr,
             commands,
             events,
+            topic,
         }
     }
 
@@ -108,8 +113,15 @@ impl Node {
     }
 
     /// Subscribes to [`TOPIC`] again.
-    fn subscribe(&self) {
-        self.command(Command::Subscribe);
+    async fn subscribe(&mut self) {
+        let (reply, topic) = async_channel::bounded(1);
+        self.command(Command::Subscribe(reply));
+        self.topic = Some(topic.recv().await.expect("node stopped"));
+    }
+
+    /// The receiver of [`TOPIC`]'s events.
+    fn topic(&self) -> &Receiver<TopicEvent> {
+        self.topic.as_ref().expect("not subscribed")
     }
 
     /// Waits for the next behaviour event.
@@ -120,12 +132,23 @@ impl Node {
             .expect("node stopped")
     }
 
-    /// Asserts that no behaviour event arrives for a while.
+    /// Waits for the next event on [`TOPIC`].
+    async fn next_topic_event(&self) -> TopicEvent {
+        tokio::time::timeout(TIMEOUT, self.topic().recv())
+            .await
+            .expect("timed out waiting for a topic event")
+            .expect("topic receiver closed")
+    }
+
+    /// Asserts that no behaviour or topic event arrives for a while.
     async fn no_event(&self) {
         if let Ok(event) =
             tokio::time::timeout(Duration::from_millis(300), self.events.recv()).await
         {
             panic!("unexpected event {event:?}");
+        }
+        if let Some(Ok(event)) = self.topic.as_ref().map(Receiver::try_recv) {
+            panic!("unexpected topic event {event:?}");
         }
     }
 
@@ -160,29 +183,44 @@ impl Node {
         }
     }
 
+    /// Waits for our subscription stream to `peer` to open.
+    async fn opened(&self, peer: PeerId) {
+        match self.next_topic_event().await {
+            TopicEvent::Opened { peer_id, .. } => assert_eq!(peer_id, peer),
+            event => panic!("unexpected topic event {event:?}"),
+        }
+    }
+
     /// Waits for the next pieces from `peer`.
     async fn recv(&self, peer: PeerId) -> ObjectPieces {
-        match self.next().await {
-            Event::Received {
-                peer_id,
-                topic_id,
-                pieces,
-                ..
+        match self.next_topic_event().await {
+            TopicEvent::Pieces {
+                peer_id, pieces, ..
             } => {
                 assert_eq!(peer_id, peer);
-                assert_eq!(topic_id, TOPIC);
                 pieces
             }
-            event => panic!("unexpected event {event:?}"),
+            event => panic!("unexpected topic event {event:?}"),
+        }
+    }
+
+    /// Waits for our subscription stream to `peer` to close.
+    async fn closed(&self, peer: PeerId) {
+        match self.next_topic_event().await {
+            TopicEvent::Closed { peer_id, .. } => assert_eq!(peer_id, peer),
+            event => panic!("unexpected topic event {event:?}"),
         }
     }
 }
 
-/// Connects `a` to `b` and returns each side's sender to the other.
+/// Connects `a` to `b` and returns each side's sender to the other, once
+/// both subscription streams are open.
 async fn connect(a: &Node, b: &Node) -> (PieceSender, PieceSender) {
     a.command(Command::Dial(b.addr.clone()));
     let a_b = a.subscribed(b.peer_id).await;
     let b_a = b.subscribed(a.peer_id).await;
+    a.opened(b.peer_id).await;
+    b.opened(a.peer_id).await;
     (a_b, b_a)
 }
 
@@ -207,6 +245,20 @@ async fn pieces_flow_both_ways() {
 
     a.no_event().await;
     b.no_event().await;
+}
+
+#[tokio::test]
+async fn pieces_from_all_peers_share_the_receiver() {
+    let a = Node::spawn(Config::default());
+    let b = Node::spawn(Config::default());
+    let c = Node::spawn(Config::default());
+    let (_a_b, b_a) = connect(&a, &b).await;
+    let (_a_c, c_a) = connect(&a, &c).await;
+
+    b_a.try_send(pieces(1)).unwrap();
+    assert_eq!(a.recv(b.peer_id).await, pieces(1));
+    c_a.try_send(pieces(2)).unwrap();
+    assert_eq!(a.recv(c.peer_id).await, pieces(2));
 }
 
 #[tokio::test]
@@ -248,15 +300,16 @@ async fn unsubscribing_ends_remote_subscription() {
 #[tokio::test]
 async fn subscribing_again_after_unsubscribing() {
     let a = Node::spawn(Config::default());
-    let b = Node::spawn(Config::default());
+    let mut b = Node::spawn(Config::default());
     let (_a_b, _b_a) = connect(&a, &b).await;
 
     b.unsubscribe();
     a.unsubscribed(b.peer_id).await;
 
     // The subscription opens again on the existing connection.
-    b.subscribe();
+    b.subscribe().await;
     let a_b = a.subscribed(b.peer_id).await;
+    b.opened(a.peer_id).await;
     a_b.try_send(pieces(0)).unwrap();
     assert_eq!(b.recv(a.peer_id).await, pieces(0));
 }
@@ -272,6 +325,7 @@ async fn dropping_sender_ends_subscription() {
     drop(a_b);
     a.unsubscribed(b.peer_id).await;
     assert_eq!(b.recv(a.peer_id).await, pieces(0));
+    b.closed(a.peer_id).await;
 }
 
 #[tokio::test]
@@ -283,6 +337,8 @@ async fn connection_close_ends_everything() {
     a.command(Command::Disconnect(b.peer_id));
     a.unsubscribed(b.peer_id).await;
     b.unsubscribed(a.peer_id).await;
+    a.closed(b.peer_id).await;
+    b.closed(a.peer_id).await;
     a.no_event().await;
     b.no_event().await;
 
