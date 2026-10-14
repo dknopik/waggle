@@ -23,6 +23,7 @@ use std::{
     task::Poll,
 };
 
+use async_channel::{Receiver, Sender};
 use libp2p::{
     PeerId,
     swarm::{
@@ -33,24 +34,12 @@ use libp2p::{
 
 use crate::{
     config::Config,
-    handler::{self, HandlerIn, ObjectPieces, PieceSender},
-    substream::CloseSignal,
+    handler::{self, HandlerIn, PieceSender, TopicEvent},
 };
 
 /// Event emitted by the waggle behaviour.
 #[derive(Debug)]
 pub enum Event {
-    /// A remote peer sent pieces on a topic we subscribed to.
-    Received {
-        /// The peer that sent the pieces.
-        peer_id: PeerId,
-        /// The connection the pieces arrived on.
-        connection_id: ConnectionId,
-        /// The topic the pieces belong to.
-        topic_id: Vec<u8>,
-        /// The received pieces.
-        pieces: ObjectPieces,
-    },
     /// A remote peer subscribed to a topic.
     ///
     /// Pieces queued on `sender` are written to the peer's subscription
@@ -81,6 +70,10 @@ pub enum Event {
 }
 
 /// Network behaviour that handles the waggle protocol.
+///
+/// Manages the topic subscriptions only. The pieces are exchanged on the
+/// channels handed to the application by [`Behaviour::subscribe`] and in
+/// [`Event::Subscribed`].
 pub struct Behaviour {
     /// Behaviour configuration: queue sizes, limits, and whitelist.
     config: Config,
@@ -88,8 +81,9 @@ pub struct Behaviour {
     pending_events: VecDeque<ToSwarm<Event, HandlerIn>>,
     /// The remote peer behind each established connection.
     connections: HashMap<ConnectionId, PeerId>,
-    /// The topics the local node is currently subscribed to.
-    subscribed_topics: HashMap<Vec<u8>, CloseSignal>,
+    /// The topics the local node is subscribed to, with the sending half of
+    /// each topic's channel.
+    subscribed_topics: HashMap<Vec<u8>, Sender<TopicEvent>>,
 }
 
 impl Behaviour {
@@ -105,40 +99,44 @@ impl Behaviour {
 
     /// Subscribes to a topic.
     ///
-    /// Returns `false` if the topic was already subscribed.
-    pub fn subscribe(&mut self, topic_id: Vec<u8>) -> bool {
+    /// Returns the receiver of the topic's [`TopicEvent`]s: the pieces all
+    /// the peers we subscribed to send on the topic, along with the opening
+    /// and closing of each peer's subscription stream.
+    ///
+    /// Returns `None` if the topic is already subscribed.
+    pub fn subscribe(&mut self, topic_id: Vec<u8>) -> Option<Receiver<TopicEvent>> {
         if self.subscribed_topics.contains_key(&topic_id) {
-            return false;
+            return None;
         }
 
-        let close_signal = CloseSignal::new();
-        // Hand every connection a receiver clone of the topic's close signal.
+        let (sender, receiver) = async_channel::unbounded();
+        // Hand every connection a clone of the topic's sender.
         for (connection_id, peer_id) in &self.connections {
             self.pending_events.push_back(ToSwarm::NotifyHandler {
                 peer_id: *peer_id,
                 handler: NotifyHandler::One(*connection_id),
                 event: HandlerIn::Subscribe {
                     topic_id: topic_id.clone(),
-                    close_signal: close_signal.receiver(),
+                    sender: sender.clone(),
                 },
             });
         }
 
-        self.subscribed_topics.insert(topic_id, close_signal);
-        true
+        self.subscribed_topics.insert(topic_id, sender);
+        Some(receiver)
     }
 
     /// Unsubscribes from a topic.
     ///
+    /// Closes the topic's channel, which closes the topic's streams on every
+    /// connection. The receiver still yields the events buffered in it.
+    ///
     /// Returns `true` if the topic was subscribed.
     pub fn unsubscribe(&mut self, topic_id: Vec<u8>) -> bool {
-        // Dropping the signal closes its channel; every connection's stream
-        // wakes and closes.
-        let Some(subscription) = self.subscribed_topics.remove(&topic_id) else {
+        let Some(sender) = self.subscribed_topics.remove(&topic_id) else {
             return false;
         };
-        drop(subscription);
-
+        sender.close();
         true
     }
 
@@ -148,13 +146,13 @@ impl Behaviour {
     fn on_connection_established(&mut self, connection_id: ConnectionId, peer_id: PeerId) {
         self.connections.insert(connection_id, peer_id);
 
-        for (topic_id, close_signal) in &self.subscribed_topics {
+        for (topic_id, sender) in &self.subscribed_topics {
             self.pending_events.push_back(ToSwarm::NotifyHandler {
                 peer_id,
                 handler: NotifyHandler::One(connection_id),
                 event: HandlerIn::Subscribe {
                     topic_id: topic_id.clone(),
-                    close_signal: close_signal.receiver(),
+                    sender: sender.clone(),
                 },
             });
         }
@@ -168,23 +166,31 @@ impl NetworkBehaviour for Behaviour {
 
     fn handle_established_inbound_connection(
         &mut self,
-        _connection_id: ConnectionId,
-        _peer_id: PeerId,
+        connection_id: ConnectionId,
+        peer_id: PeerId,
         _local_addr: &libp2p::Multiaddr,
         _remote_addr: &libp2p::Multiaddr,
     ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
-        Ok(handler::Handler::new(self.config.clone()))
+        Ok(handler::Handler::new(
+            self.config.clone(),
+            peer_id,
+            connection_id,
+        ))
     }
 
     fn handle_established_outbound_connection(
         &mut self,
-        _connection_id: ConnectionId,
-        _peer_id: PeerId,
+        connection_id: ConnectionId,
+        peer_id: PeerId,
         _addr: &libp2p::Multiaddr,
         _role_override: libp2p::core::Endpoint,
         _port_use: libp2p::core::transport::PortUse,
     ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
-        Ok(handler::Handler::new(self.config.clone()))
+        Ok(handler::Handler::new(
+            self.config.clone(),
+            peer_id,
+            connection_id,
+        ))
     }
 
     fn on_swarm_event(&mut self, event: FromSwarm) {
@@ -217,19 +223,6 @@ impl NetworkBehaviour for Behaviour {
                 topic_id,
                 sender,
             },
-            handler::Event::Received { topic_id, pieces } => {
-                // Ignore pieces for a topic the local node is not subscribed to.
-                if !self.subscribed_topics.contains_key(&topic_id) {
-                    tracing::debug!(peer_id=%peer_id, "Received piece for an unsubscribed topic");
-                    return;
-                }
-                Event::Received {
-                    peer_id,
-                    connection_id,
-                    topic_id,
-                    pieces,
-                }
-            }
             handler::Event::Unsubscribed { topic_id } => Event::Unsubscribed {
                 peer_id,
                 connection_id,
@@ -281,7 +274,7 @@ mod tests {
             .unwrap();
 
         // No subscription is sent to the denied connection.
-        behaviour.subscribe(TOPIC.to_vec());
+        let _receiver = behaviour.subscribe(TOPIC.to_vec()).unwrap();
         assert!(poll(&mut behaviour).is_pending());
     }
 }
