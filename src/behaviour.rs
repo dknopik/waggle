@@ -25,7 +25,10 @@ use std::{
 
 use libp2p::{
     PeerId,
-    swarm::{ConnectionClosed, ConnectionId, FromSwarm, NetworkBehaviour, NotifyHandler, ToSwarm},
+    swarm::{
+        ConnectionClosed, ConnectionId, FromSwarm, NetworkBehaviour, NotifyHandler, ToSwarm,
+        behaviour::ConnectionEstablished,
+    },
 };
 
 use crate::{
@@ -139,14 +142,10 @@ impl Behaviour {
         true
     }
 
-    /// Tracks a newly established connection and creates its handler.
+    /// Tracks a newly established connection.
     ///
     /// Subscribes the connection to all the topics we are subscribed to.
-    fn on_connection_established(
-        &mut self,
-        connection_id: ConnectionId,
-        peer_id: PeerId,
-    ) -> handler::Handler {
+    fn on_connection_established(&mut self, connection_id: ConnectionId, peer_id: PeerId) {
         self.connections.insert(connection_id, peer_id);
 
         for (topic_id, close_signal) in &self.subscribed_topics {
@@ -159,8 +158,6 @@ impl Behaviour {
                 },
             });
         }
-
-        handler::Handler::new(self.config.clone())
     }
 }
 
@@ -171,28 +168,39 @@ impl NetworkBehaviour for Behaviour {
 
     fn handle_established_inbound_connection(
         &mut self,
-        connection_id: ConnectionId,
-        peer_id: PeerId,
+        _connection_id: ConnectionId,
+        _peer_id: PeerId,
         _local_addr: &libp2p::Multiaddr,
         _remote_addr: &libp2p::Multiaddr,
     ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
-        Ok(self.on_connection_established(connection_id, peer_id))
+        Ok(handler::Handler::new(self.config.clone()))
     }
 
     fn handle_established_outbound_connection(
         &mut self,
-        connection_id: ConnectionId,
-        peer_id: PeerId,
+        _connection_id: ConnectionId,
+        _peer_id: PeerId,
         _addr: &libp2p::Multiaddr,
         _role_override: libp2p::core::Endpoint,
         _port_use: libp2p::core::transport::PortUse,
     ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
-        Ok(self.on_connection_established(connection_id, peer_id))
+        Ok(handler::Handler::new(self.config.clone()))
     }
 
     fn on_swarm_event(&mut self, event: FromSwarm) {
-        if let FromSwarm::ConnectionClosed(ConnectionClosed { connection_id, .. }) = event {
-            self.connections.remove(&connection_id);
+        match event {
+            // Track connections here rather than when creating the handler:
+            // another behaviour may still deny the connection, which the
+            // swarm then reports as a dial or listen failure instead.
+            FromSwarm::ConnectionEstablished(ConnectionEstablished {
+                peer_id,
+                connection_id,
+                ..
+            }) => self.on_connection_established(connection_id, peer_id),
+            FromSwarm::ConnectionClosed(ConnectionClosed { connection_id, .. }) => {
+                self.connections.remove(&connection_id);
+            }
+            _ => {}
         }
     }
 
@@ -240,5 +248,40 @@ impl NetworkBehaviour for Behaviour {
         }
 
         std::task::Poll::Pending
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::task::{Context, Waker};
+
+    use libp2p::Multiaddr;
+
+    use super::*;
+
+    const TOPIC: &[u8] = b"topic";
+
+    fn poll(behaviour: &mut Behaviour) -> Poll<ToSwarm<Event, HandlerIn>> {
+        behaviour.poll(&mut Context::from_waker(Waker::noop()))
+    }
+
+    #[test]
+    fn denied_connection_is_not_tracked() {
+        let mut behaviour = Behaviour::new(Config::default());
+        // Another behaviour denies the connection after this one created its
+        // handler, so the swarm never reports it as established.
+        let addr = Multiaddr::empty();
+        behaviour
+            .handle_established_inbound_connection(
+                ConnectionId::new_unchecked(0),
+                PeerId::random(),
+                &addr,
+                &addr,
+            )
+            .unwrap();
+
+        // No subscription is sent to the denied connection.
+        behaviour.subscribe(TOPIC.to_vec());
+        assert!(poll(&mut behaviour).is_pending());
     }
 }
