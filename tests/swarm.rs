@@ -2,7 +2,7 @@
 //! memory transport, exchanging pieces on the channels handed to the
 //! application.
 
-use std::time::Duration;
+use std::{num::NonZeroUsize, time::Duration};
 
 use async_channel::{Receiver, Sender};
 use futures::StreamExt;
@@ -228,6 +228,16 @@ fn pieces(i: u8) -> ObjectPieces {
     }
 }
 
+/// Pieces with a 32 KiB payload, so a few of them fill the transport's
+/// buffers.
+fn large_pieces(i: u32) -> ObjectPieces {
+    ObjectPieces {
+        object_id: i.to_be_bytes().to_vec(),
+        metadata: None,
+        pieces: Some(vec![0; 32 * 1024]),
+    }
+}
+
 #[tokio::test]
 async fn pieces_flow_both_ways() {
     let a = Node::spawn(Config::default());
@@ -255,6 +265,44 @@ async fn pieces_from_all_peers_share_the_receiver() {
     assert_eq!(a.recv(b.peer_id).await, pieces(1));
     c_a.try_send(pieces(2)).unwrap();
     assert_eq!(a.recv(c.peer_id).await, pieces(2));
+}
+
+#[tokio::test]
+async fn full_receive_queue_pauses_reading() {
+    let a = Node::spawn(Config::default().set_max_connection_queue_limit(10));
+    let b = Node::spawn(Config::default().set_max_receive_queue_len(NonZeroUsize::new(2).unwrap()));
+    let (a_b, _b_a) = connect(&a, &b).await;
+
+    // B stops reading once its receive queue is full. The transport's
+    // buffers fill next, then A's connection queue, which stays full instead
+    // of draining. A queue full for a short while only means A sent faster
+    // than its writer drains.
+    let mut sent = 0;
+    let mut full_polls = 0;
+    tokio::time::timeout(TIMEOUT, async {
+        while full_polls < 30 {
+            match a_b.try_send(large_pieces(sent)) {
+                Ok(()) => {
+                    sent += 1;
+                    full_polls = 0;
+                    tokio::task::yield_now().await;
+                }
+                Err(SendError::Full) => {
+                    full_polls += 1;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(SendError::Closed) => panic!("subscription closed"),
+            }
+        }
+    })
+    .await
+    .expect("connection queue did not stay full");
+    assert!(b.topic().is_full());
+
+    // Draining the queue resumes reading, without losing pieces.
+    for i in 0..sent {
+        assert_eq!(b.recv(a.peer_id).await, large_pieces(i));
+    }
 }
 
 #[tokio::test]
@@ -312,10 +360,11 @@ async fn subscribing_again_after_dropping_receiver() {
 #[tokio::test]
 async fn dropping_sender_ends_subscription() {
     let a = Node::spawn(Config::default());
-    let b = Node::spawn(Config::default());
+    let b = Node::spawn(Config::default().set_max_receive_queue_len(NonZeroUsize::new(1).unwrap()));
     let (a_b, _b_a) = connect(&a, &b).await;
 
-    // The pieces queued before the sender was dropped are still sent.
+    // The piece fills B's receive queue, so the end of the stream waits for
+    // room behind it.
     a_b.try_send(pieces(0)).unwrap();
     drop(a_b);
     a.unsubscribed(b.peer_id).await;
@@ -339,4 +388,34 @@ async fn connection_close_ends_everything() {
 
     assert!(matches!(a_b.try_send(pieces(0)), Err(SendError::Closed)));
     assert!(matches!(b_a.try_send(pieces(0)), Err(SendError::Closed)));
+}
+
+#[tokio::test]
+async fn connection_close_delivers_waiting_pieces() {
+    let a = Node::spawn(Config::default());
+    let b = Node::spawn(Config::default().set_max_receive_queue_len(NonZeroUsize::new(1).unwrap()));
+    let (a_b, _b_a) = connect(&a, &b).await;
+
+    // The first piece fills B's receive queue, the second waits for room.
+    a_b.try_send(pieces(0)).unwrap();
+    a_b.try_send(pieces(1)).unwrap();
+    tokio::time::timeout(TIMEOUT, async {
+        while !b.topic().is_full() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("receive queue did not fill");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // The full receive queue does not hold up closing the connection: A sees
+    // it close before B drains the queue.
+    b.command(Command::Disconnect(a.peer_id));
+    b.unsubscribed(a.peer_id).await;
+    a.unsubscribed(b.peer_id).await;
+    a.closed(b.peer_id).await;
+
+    assert_eq!(b.recv(a.peer_id).await, pieces(0));
+    assert_eq!(b.recv(a.peer_id).await, pieces(1));
+    b.closed(a.peer_id).await;
 }
