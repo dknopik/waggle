@@ -64,9 +64,9 @@ pub enum Event {
     },
     /// A remote peer's subscription to a topic ended.
     ///
-    /// The peer unsubscribed, the stream failed, or every clone of the
-    /// subscription's `sender` was dropped. The `sender` no longer accepts
-    /// pieces.
+    /// The peer unsubscribed, the stream failed, the connection closed, or
+    /// every clone of the subscription's `sender` was dropped. The `sender`
+    /// no longer accepts pieces.
     Unsubscribed {
         /// The remote peer that unsubscribed.
         peer_id: PeerId,
