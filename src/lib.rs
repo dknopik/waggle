@@ -26,19 +26,18 @@
 //!
 //! # Design Highlights
 //!
-//! - **Per-topic streams** — Each topic uses dedicated streams. Subscribing opens a
-//!   stream; unsubscribing closes it.
-//! - **Random dissemination** — Publishing and forwarding select random subsets of
-//!   connected peers.
-//! - **Application-defined scoring** — Peer scoring is left entirely to the
-//!   application. The protocol surfaces relevant events but does not bake in scoring.
-//! - **Opaque identifiers** — Topics, objects, and piece metadata are opaque to the
-//!   protocol; semantics are defined by the application.
+//! - **Per-topic streams** — Each topic uses dedicated streams. Subscribing opens a stream;
+//!   unsubscribing closes it.
+//! - **Application-defined scoring** — Peer scoring is left entirely to the application. The
+//!   protocol surfaces relevant events but does not bake in scoring.
+//! - **Opaque identifiers** — Topics, objects, and piece metadata are opaque to the protocol;
+//!   semantics are defined by the application.
 //!
 //! # Using Waggle
 //!
-//! See [`Config`] for configuration and [`Behaviour`] for the [`NetworkBehaviour`]
-//! implementation.
+//! See [`Config`](config::Config) for configuration and
+//! [`Behaviour`](behaviour::Behaviour) for the
+//! [`NetworkBehaviour`](libp2p::swarm::NetworkBehaviour) implementation.
 
 mod protocol;
 
@@ -47,4 +46,3 @@ pub(crate) mod substream;
 pub mod behaviour;
 pub mod config;
 pub mod handler;
-pub mod shard;

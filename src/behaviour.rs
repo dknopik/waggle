@@ -29,14 +29,12 @@ use libp2p::{
     PeerId,
     swarm::{ConnectionClosed, ConnectionId, FromSwarm, NetworkBehaviour, NotifyHandler, ToSwarm},
 };
-use rand::seq::SliceRandom;
 
 use crate::{
     config::Config,
     handler::{self, HandlerIn, Received},
     protocol::proto::ObjectPieces,
-    shard::{ReconcileAction, Shard, State},
-    substream::{CloseSignal, DispatchHub, SendError},
+    substream::{CloseSignal, DispatchHub},
 };
 
 /// Event emitted by the waggle behaviour.
@@ -65,27 +63,12 @@ pub enum Event {
         /// The topic it unsubscribed from.
         topic_id: Vec<u8>,
     },
-    /// Data failed to reconcile against a peer's tracked metadata.
-    ///
-    /// The data may come from the peer, as in a received message, or from the
-    /// local node, as in a newly published piece. It is not necessarily peer
-    /// misbehavior. The application decides how to treat the peer.
-    InvalidData {
-        peer_id: PeerId,
-        topic_id: Vec<u8>,
-        object_id: Vec<u8>,
-        reason: crate::shard::Error,
-    },
-    /// A remote peer has its send queue full.
-    FullQueue(PeerId),
 }
 
 /// Network behaviour that handles the waggle protocol.
 pub struct Behaviour {
-    /// Behaviour configuration: queue sizes, limits, whitelist, and cache.
+    /// Behaviour configuration: queue sizes, limits, and whitelist.
     config: Config,
-    /// Piece-dissemination engine: the local object cache and per-connection views.
-    state: State,
     /// Outbound events to the swarm, drained in `poll`.
     pending_events: VecDeque<ToSwarm<Event, HandlerIn>>,
     /// Established connections.
@@ -115,18 +98,12 @@ impl Connection {
     fn unsubscribe(&mut self, topic_id: &[u8]) {
         self.hub.senders.remove(topic_id);
     }
-
-    /// Checks if the connection is subscribed to the topic.
-    fn is_subscribed(&self, topic_id: &[u8]) -> bool {
-        self.hub.senders.contains_key(topic_id)
-    }
 }
 
 impl Behaviour {
     /// Creates a new waggle [`Behaviour`] instance with the given [`Config`].
     pub fn new(config: Config) -> Self {
         Self {
-            state: State::new(config.max_cached_objects()),
             config,
             pending_events: VecDeque::new(),
             connections: HashMap::new(),
@@ -170,222 +147,7 @@ impl Behaviour {
         };
         drop(subscription);
 
-        self.state.remove_topic(&topic_id);
         true
-    }
-
-    /// Publishes an object piece to a topic.
-    ///
-    /// Disseminates the pieces to the topic's subscribers. Caches the pieces
-    /// for reconciliation with peers that are missing them. `topic` selects
-    /// the topic to which the piece belongs. `piece` carries the object
-    /// identifier, the metadata, and the payload bits.
-    ///
-    /// Returns an [`Error`](crate::Error) if no peers are subscribed to the
-    /// topic or the piece cannot be queued.
-    pub fn publish<T: Into<Vec<u8>>, P: Shard + 'static>(
-        &mut self,
-        topic_id: T,
-        piece: P,
-    ) -> Result<(), Error> {
-        let topic_id = topic_id.into();
-        let object_id = piece.object_id();
-
-        let mut eligible: Vec<(&ConnectionId, &Connection)> = self
-            .connections
-            .iter()
-            .filter(|(_connection_id, connection)| connection.is_subscribed(&topic_id))
-            .collect();
-
-        if eligible.is_empty() {
-            return Err(Error::NoPeersSubscribedToTopic);
-        }
-
-        eligible.shuffle(&mut rand::rng());
-
-        // Cache and disseminate. When the metadata is unchanged, there is
-        // nothing new to send.
-        if !self.state.store(&topic_id, piece) {
-            return Ok(());
-        }
-
-        // Select a random subset of the eligible connections to publish to.
-        let publish_fanout = self.config.topic_config(&topic_id).publish_fanout();
-
-        let mut full = vec![];
-        let mut no_data = vec![];
-        let mut published = 0;
-        for (connection_id, connection) in eligible {
-            if published >= publish_fanout.get() {
-                break;
-            }
-
-            match self
-                .state
-                .reconcile(&topic_id, *connection_id, connection.peer_id, &object_id)
-            {
-                Ok(None) => {
-                    no_data.push(*connection_id);
-                }
-                Ok(Some(ReconcileAction { body, metadata })) => {
-                    let message = ObjectPieces {
-                        object_id: object_id.clone(),
-                        pieces_metadata: metadata,
-                        pieces: body,
-                    };
-
-                    match connection.hub.try_send(&topic_id, message) {
-                        Ok(()) => {
-                            published += 1;
-                        }
-                        Err(SendError::Full) => {
-                            tracing::debug!(peer_id=%connection.peer_id, "Outbound queue full for peer");
-                            full.push(*connection_id);
-                        }
-                        Err(err @ (SendError::Closed | SendError::UnknownTopic)) => {
-                            tracing::error!(peer_id=%connection.peer_id, error=%err, "Failed to send message");
-                        }
-                    }
-                }
-                Err(reason) => {
-                    self.pending_events
-                        .push_back(ToSwarm::GenerateEvent(Event::InvalidData {
-                            peer_id: connection.peer_id,
-                            topic_id: topic_id.clone(),
-                            object_id: object_id.clone(),
-                            reason,
-                        }))
-                }
-            }
-        }
-
-        if published == 0 {
-            return Err(Error::MessageNotSent { full, no_data });
-        }
-        Ok(())
-    }
-
-    /// Reconciles a piece received on a connection and reports the outcome.
-    ///
-    /// Reconciles the received piece against any cached object. Emits the piece
-    /// to the application when needed. Sends the reconciled reply back on the
-    /// same connection.
-    fn handle_received(
-        &mut self,
-        peer_id: PeerId,
-        connection_id: ConnectionId,
-        received: Received,
-    ) {
-        // Ignore pieces for a topic the local node is not subscribed to.
-        if !self.subscribed_topics.contains_key(&received.topic_id) {
-            tracing::debug!(peer_id=%peer_id, "Received piece for an unsubscribed topic");
-            return;
-        }
-
-        let outcome = match self.state.received(connection_id, peer_id, &received) {
-            Ok(Some(o)) => o,
-            Ok(None) => return,
-            Err(reason) => {
-                self.pending_events
-                    .push_back(ToSwarm::GenerateEvent(Event::InvalidData {
-                        peer_id,
-                        topic_id: received.topic_id,
-                        object_id: received.object_id,
-                        reason,
-                    }));
-                return;
-            }
-        };
-
-        // Send the received piece to the application.
-        if outcome.emit {
-            self.pending_events
-                .push_back(ToSwarm::GenerateEvent(Event::Received {
-                    topic_id: received.topic_id.clone(),
-                    peer_id,
-                    received: received.clone(),
-                }));
-        }
-
-        // Send the reconciled reply to the peer.
-        if let Some((body, local_metadata)) = outcome.send {
-            let message = ObjectPieces {
-                object_id: received.object_id.clone(),
-                pieces_metadata: Some(local_metadata),
-                pieces: Some(body),
-            };
-
-            let Some(connection) = self.connections.get(&connection_id) else {
-                tracing::error!(peer_id=%peer_id, "Piece received by unknown connection");
-                return;
-            };
-
-            match connection.hub.try_send(&received.topic_id, message) {
-                Ok(()) => {}
-                Err(SendError::Full) => {
-                    tracing::debug!(peer_id=%peer_id, "Outbound queue full for peer");
-                    self.pending_events
-                        .push_back(ToSwarm::GenerateEvent(Event::FullQueue(peer_id)));
-                }
-                Err(err @ (SendError::Closed | SendError::UnknownTopic)) => {
-                    tracing::error!(peer_id=%peer_id, error=%err, "Failed to send message");
-                }
-            }
-        }
-
-        // Gossip the metadata for peers that don't have it yet
-        let mut eligible: Vec<(&ConnectionId, &Connection)> = self
-            .connections
-            .iter()
-            .filter(|(id, connection)| {
-                **id != connection_id && connection.hub.senders.contains_key(&received.topic_id)
-            })
-            .collect();
-        eligible.shuffle(&mut rand::rng());
-
-        let gossip_fanout = self.config.topic_config(&received.topic_id).gossip_fanout();
-        let mut sent = 0;
-
-        for (connection_id, connection) in &eligible {
-            if sent >= gossip_fanout.get() {
-                break;
-            }
-
-            match self.state.reconcile(
-                &received.topic_id,
-                **connection_id,
-                connection.peer_id,
-                &received.object_id,
-            ) {
-                // Nothing new for this peer.
-                Ok(None) => {}
-                Ok(Some(ReconcileAction { metadata, .. })) => {
-                    let message = ObjectPieces {
-                        object_id: received.object_id.clone(),
-                        pieces_metadata: metadata,
-                        pieces: None,
-                    };
-                    match connection.hub.try_send(&received.topic_id, message) {
-                        Ok(()) => sent += 1,
-                        Err(SendError::Full) => {
-                            tracing::debug!(peer_id=%connection.peer_id, "Outbound queue full for peer");
-                        }
-                        Err(err @ (SendError::Closed | SendError::UnknownTopic)) => {
-                            tracing::error!(peer_id=%connection.peer_id, error=%err, "Failed to send message");
-                        }
-                    }
-                }
-                Err(reason) => {
-                    self.pending_events
-                        .push_back(ToSwarm::GenerateEvent(Event::InvalidData {
-                            peer_id: connection.peer_id,
-                            topic_id: received.topic_id.clone(),
-                            object_id: received.object_id.clone(),
-                            reason,
-                        }));
-                }
-            }
-        }
     }
 }
 
@@ -452,7 +214,6 @@ impl NetworkBehaviour for Behaviour {
     fn on_swarm_event(&mut self, event: FromSwarm) {
         if let FromSwarm::ConnectionClosed(ConnectionClosed { connection_id, .. }) = event {
             self.connections.remove(&connection_id);
-            self.state.connection_closed(connection_id);
         }
     }
 
@@ -477,7 +238,18 @@ impl NetworkBehaviour for Behaviour {
                     }))
             }
             handler::Event::Received(received) => {
-                self.handle_received(peer_id, connection_id, received)
+                // Ignore pieces for a topic the local node is not subscribed to.
+                if !self.subscribed_topics.contains_key(&received.topic_id) {
+                    tracing::debug!(peer_id=%peer_id, "Received piece for an unsubscribed topic");
+                    return;
+                }
+
+                self.pending_events
+                    .push_back(ToSwarm::GenerateEvent(Event::Received {
+                        topic_id: received.topic_id.clone(),
+                        peer_id,
+                        received,
+                    }));
             }
 
             handler::Event::Unsubscribed { topic_id } => {
@@ -506,22 +278,4 @@ impl NetworkBehaviour for Behaviour {
 
         std::task::Poll::Pending
     }
-}
-
-/// Error associated with publishing an object piece on a topic.
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    /// No peers are currently subscribed to receive messages on this topic.
-    /// Wait for peers to subscribe or check the network connectivity.
-    #[error("no peers subscribed to the topic")]
-    NoPeersSubscribedToTopic,
-    /// A piece could not be delivered on any selected connection.
-    #[error("message not sent on any of the connections, {0} full and {1} did not require new data",
-         full.len(), no_data.len())]
-    MessageNotSent {
-        /// Connections whose send queue was full.
-        full: Vec<ConnectionId>,
-        /// Connections that had nothing new to send.
-        no_data: Vec<ConnectionId>,
-    },
 }
