@@ -274,8 +274,8 @@ impl PieceSender {
 ///
 /// Reads the messages of one topic from its channel and writes them to the
 /// subscription stream the remote peer opened for that topic. The future
-/// completes with the topic when every sender of the channel is dropped or
-/// a write fails.
+/// completes with the topic when the remote closes its half of the stream,
+/// every sender of the channel is dropped, or a write fails.
 pub struct Inbound {
     topic: Vec<u8>,
     receiver: Pin<Box<Receiver<proto::ObjectPieces>>>,
@@ -334,6 +334,25 @@ impl Future for Inbound {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
+
+        // The remote sends nothing after subscribing: its half of the stream
+        // only ends when it unsubscribes or the stream fails.
+        if !matches!(this.state, InboundState::Closed)
+            && let Poll::Ready(read) = this.framed.as_mut().poll_next(cx)
+        {
+            match read {
+                None => tracing::debug!(topic = ?this.topic, "Remote closed inbound stream"),
+                Some(Ok(_)) => {
+                    tracing::debug!(topic = ?this.topic, "Unexpected message on inbound stream")
+                }
+                Some(Err(err)) => {
+                    tracing::debug!(topic = ?this.topic, "Inbound stream error: {err}")
+                }
+            }
+            this.state = InboundState::Closed;
+            return Poll::Ready(this.topic.clone());
+        }
+
         loop {
             let state = std::mem::replace(&mut this.state, InboundState::Poisoned);
             match state {

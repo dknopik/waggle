@@ -24,6 +24,9 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 /// Instructions for a node's swarm task.
 enum Command {
     Dial(Multiaddr),
+    Subscribe,
+    Unsubscribe,
+    Disconnect(PeerId),
 }
 
 /// A swarm subscribed to [`TOPIC`] and listening on a memory address, driven
@@ -66,6 +69,16 @@ impl Node {
                 tokio::select! {
                     command = command_rx.recv() => match command {
                         Ok(Command::Dial(addr)) => swarm.dial(addr).unwrap(),
+                        Ok(Command::Subscribe) => {
+                            let subscribed = swarm.behaviour_mut().subscribe(TOPIC.to_vec());
+                            assert!(subscribed, "already subscribed");
+                        }
+                        Ok(Command::Unsubscribe) => {
+                            swarm.behaviour_mut().unsubscribe(TOPIC.to_vec());
+                        }
+                        Ok(Command::Disconnect(peer_id)) => {
+                            let _ = swarm.disconnect_peer_id(peer_id);
+                        }
                         Err(_) => return,
                     },
                     event = swarm.select_next_some() => {
@@ -87,6 +100,16 @@ impl Node {
 
     fn command(&self, command: Command) {
         self.commands.try_send(command).unwrap();
+    }
+
+    /// Unsubscribes from [`TOPIC`].
+    fn unsubscribe(&self) {
+        self.command(Command::Unsubscribe);
+    }
+
+    /// Subscribes to [`TOPIC`] again.
+    fn subscribe(&self) {
+        self.command(Command::Subscribe);
     }
 
     /// Waits for the next behaviour event.
@@ -207,6 +230,38 @@ async fn connection_queue_limit() {
 }
 
 #[tokio::test]
+async fn unsubscribing_ends_remote_subscription() {
+    let a = Node::spawn(Config::default());
+    let b = Node::spawn(Config::default());
+    let (a_b, b_a) = connect(&a, &b).await;
+
+    // A notices without sending on the subscription.
+    b.unsubscribe();
+    a.unsubscribed(b.peer_id).await;
+    assert!(matches!(a_b.try_send(pieces(0)), Err(SendError::Closed)));
+
+    // A's subscription to B is untouched.
+    b_a.try_send(pieces(1)).unwrap();
+    assert_eq!(a.recv(b.peer_id).await, pieces(1));
+}
+
+#[tokio::test]
+async fn subscribing_again_after_unsubscribing() {
+    let a = Node::spawn(Config::default());
+    let b = Node::spawn(Config::default());
+    let (_a_b, _b_a) = connect(&a, &b).await;
+
+    b.unsubscribe();
+    a.unsubscribed(b.peer_id).await;
+
+    // The subscription opens again on the existing connection.
+    b.subscribe();
+    let a_b = a.subscribed(b.peer_id).await;
+    a_b.try_send(pieces(0)).unwrap();
+    assert_eq!(b.recv(a.peer_id).await, pieces(0));
+}
+
+#[tokio::test]
 async fn dropping_sender_ends_subscription() {
     let a = Node::spawn(Config::default());
     let b = Node::spawn(Config::default());
@@ -217,4 +272,20 @@ async fn dropping_sender_ends_subscription() {
     drop(a_b);
     a.unsubscribed(b.peer_id).await;
     assert_eq!(b.recv(a.peer_id).await, pieces(0));
+}
+
+#[tokio::test]
+async fn connection_close_ends_everything() {
+    let a = Node::spawn(Config::default());
+    let b = Node::spawn(Config::default());
+    let (a_b, b_a) = connect(&a, &b).await;
+
+    a.command(Command::Disconnect(b.peer_id));
+    a.unsubscribed(b.peer_id).await;
+    b.unsubscribed(a.peer_id).await;
+    a.no_event().await;
+    b.no_event().await;
+
+    assert!(matches!(a_b.try_send(pieces(0)), Err(SendError::Closed)));
+    assert!(matches!(b_a.try_send(pieces(0)), Err(SendError::Closed)));
 }

@@ -73,7 +73,8 @@ pub enum Event {
         pieces: ObjectPieces,
     },
     /// The remote peer's subscription ended: the remote closed the stream,
-    /// an error occurred, or every `sender` was dropped.
+    /// an error occurred, the connection closed, or every `sender` was
+    /// dropped.
     Unsubscribed { topic_id: Vec<u8> },
 }
 
@@ -207,6 +208,24 @@ impl ConnectionHandler for Handler {
         }
 
         Poll::Pending
+    }
+
+    fn poll_close(&mut self, _: &mut Context<'_>) -> Poll<Option<Self::ToBehaviour>> {
+        // The remote subscriptions end with the connection. Their
+        // notifications go behind the pending ones, so every remote
+        // subscription is reported before it ends.
+        self.inbound_substreams.clear();
+        self.pending_events
+            .extend(self.inbound_subscriptions.drain().map(|topic_id| {
+                ConnectionHandlerEvent::NotifyBehaviour(Event::Unsubscribed { topic_id })
+            }));
+
+        while let Some(event) = self.pending_events.pop_front() {
+            if let ConnectionHandlerEvent::NotifyBehaviour(event) = event {
+                return Poll::Ready(Some(event));
+            }
+        }
+        Poll::Ready(None)
     }
 
     fn on_connection_event(
