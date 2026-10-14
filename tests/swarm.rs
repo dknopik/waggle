@@ -27,7 +27,6 @@ enum Command {
     Dial(Multiaddr),
     /// Subscribes to [`TOPIC`], replying with the topic's receiver.
     Subscribe(Sender<Receiver<TopicEvent>>),
-    Unsubscribe,
     Disconnect(PeerId),
 }
 
@@ -38,7 +37,7 @@ struct Node {
     addr: Multiaddr,
     commands: Sender<Command>,
     events: Receiver<Event>,
-    /// The receiver of [`TOPIC`]'s events.
+    /// The receiver of [`TOPIC`]'s events, until the test unsubscribes.
     topic: Option<Receiver<TopicEvent>>,
 }
 
@@ -77,9 +76,6 @@ impl Node {
                             let topic = swarm.behaviour_mut().subscribe(TOPIC.to_vec());
                             let _ = reply.try_send(topic.expect("already subscribed"));
                         }
-                        Ok(Command::Unsubscribe) => {
-                            swarm.behaviour_mut().unsubscribe(TOPIC.to_vec());
-                        }
                         Ok(Command::Disconnect(peer_id)) => {
                             let _ = swarm.disconnect_peer_id(peer_id);
                         }
@@ -107,9 +103,9 @@ impl Node {
         self.commands.try_send(command).unwrap();
     }
 
-    /// Unsubscribes from [`TOPIC`].
-    fn unsubscribe(&self) {
-        self.command(Command::Unsubscribe);
+    /// Unsubscribes from [`TOPIC`] by dropping its receiver.
+    fn unsubscribe(&mut self) {
+        self.topic = None;
     }
 
     /// Subscribes to [`TOPIC`] again.
@@ -282,12 +278,11 @@ async fn connection_queue_limit() {
 }
 
 #[tokio::test]
-async fn unsubscribing_ends_remote_subscription() {
+async fn dropping_receiver_unsubscribes() {
     let a = Node::spawn(Config::default());
-    let b = Node::spawn(Config::default());
+    let mut b = Node::spawn(Config::default());
     let (a_b, b_a) = connect(&a, &b).await;
 
-    // A notices without sending on the subscription.
     b.unsubscribe();
     a.unsubscribed(b.peer_id).await;
     assert!(matches!(a_b.try_send(pieces(0)), Err(SendError::Closed)));
@@ -298,7 +293,7 @@ async fn unsubscribing_ends_remote_subscription() {
 }
 
 #[tokio::test]
-async fn subscribing_again_after_unsubscribing() {
+async fn subscribing_again_after_dropping_receiver() {
     let a = Node::spawn(Config::default());
     let mut b = Node::spawn(Config::default());
     let (_a_b, _b_a) = connect(&a, &b).await;

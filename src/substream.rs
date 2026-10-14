@@ -42,8 +42,8 @@ use crate::{
 /// Forwards the pieces of one topic read from our subscription stream to the
 /// topic's channel, between a [`TopicEvent::Opened`] and a
 /// [`TopicEvent::Closed`]. Completes once the stream ended, or once the
-/// channel closed and the stream with it: the application unsubscribed from
-/// the topic.
+/// channel closed and the stream with it: the application dropped the
+/// receiver, unsubscribing from the topic.
 pub struct Outbound {
     topic: Vec<u8>,
     /// The remote peer of the stream.
@@ -180,8 +180,8 @@ impl Future for Outbound {
         loop {
             match &mut this.state {
                 OutboundState::Active(framed) => {
-                    // The application unsubscribed: close the stream without
-                    // waiting for the next piece.
+                    // The application dropped the receiver: close the stream
+                    // without waiting for the next piece.
                     if this.unsubscribed.as_mut().poll(cx).is_ready() {
                         this.unsubscribe();
                         continue;

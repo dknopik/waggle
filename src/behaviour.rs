@@ -24,6 +24,7 @@ use std::{
 };
 
 use async_channel::{Receiver, Sender};
+use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use libp2p::{
     PeerId,
     swarm::{
@@ -82,8 +83,12 @@ pub struct Behaviour {
     /// The remote peer behind each established connection.
     connections: HashMap<ConnectionId, PeerId>,
     /// The topics the local node is subscribed to, with the sending half of
-    /// each topic's channel.
+    /// each topic's channel. A topic whose channel closed is unsubscribed,
+    /// and forgotten in `poll`.
     subscribed_topics: HashMap<Vec<u8>, Sender<TopicEvent>>,
+    /// Resolve with their topic when the application drops a topic's
+    /// receiver.
+    unsubscriptions: FuturesUnordered<BoxFuture<'static, Vec<u8>>>,
 }
 
 impl Behaviour {
@@ -94,6 +99,7 @@ impl Behaviour {
             pending_events: VecDeque::new(),
             connections: HashMap::new(),
             subscribed_topics: HashMap::new(),
+            unsubscriptions: FuturesUnordered::new(),
         }
     }
 
@@ -101,11 +107,17 @@ impl Behaviour {
     ///
     /// Returns the receiver of the topic's [`TopicEvent`]s: the pieces all
     /// the peers we subscribed to send on the topic, along with the opening
-    /// and closing of each peer's subscription stream.
+    /// and closing of each peer's subscription stream. The subscription
+    /// lasts until the receiver is dropped, which closes the topic's streams
+    /// on every connection.
     ///
     /// Returns `None` if the topic is already subscribed.
     pub fn subscribe(&mut self, topic_id: Vec<u8>) -> Option<Receiver<TopicEvent>> {
-        if self.subscribed_topics.contains_key(&topic_id) {
+        if self
+            .subscribed_topics
+            .get(&topic_id)
+            .is_some_and(|sender| !sender.is_closed())
+        {
             return None;
         }
 
@@ -122,22 +134,15 @@ impl Behaviour {
             });
         }
 
+        // `Sender::closed` borrows the sender, so the future owns a clone.
+        let watched = sender.clone();
+        let watched_topic = topic_id.clone();
+        self.unsubscriptions.push(Box::pin(async move {
+            watched.closed().await;
+            watched_topic
+        }));
         self.subscribed_topics.insert(topic_id, sender);
         Some(receiver)
-    }
-
-    /// Unsubscribes from a topic.
-    ///
-    /// Closes the topic's channel, which closes the topic's streams on every
-    /// connection. The receiver still yields the events buffered in it.
-    ///
-    /// Returns `true` if the topic was subscribed.
-    pub fn unsubscribe(&mut self, topic_id: Vec<u8>) -> bool {
-        let Some(sender) = self.subscribed_topics.remove(&topic_id) else {
-            return false;
-        };
-        sender.close();
-        true
     }
 
     /// Tracks a newly established connection.
@@ -147,6 +152,11 @@ impl Behaviour {
         self.connections.insert(connection_id, peer_id);
 
         for (topic_id, sender) in &self.subscribed_topics {
+            // The application unsubscribed, but `poll` has not forgotten the
+            // topic yet.
+            if sender.is_closed() {
+                continue;
+            }
             self.pending_events.push_back(ToSwarm::NotifyHandler {
                 peer_id,
                 handler: NotifyHandler::One(connection_id),
@@ -234,8 +244,20 @@ impl NetworkBehaviour for Behaviour {
 
     fn poll(
         &mut self,
-        _cx: &mut std::task::Context<'_>,
+        cx: &mut std::task::Context<'_>,
     ) -> Poll<ToSwarm<Self::ToSwarm, libp2p::swarm::THandlerInEvent<Self>>> {
+        // Forget the topics the application unsubscribed from, unless it
+        // subscribed again since.
+        while let Poll::Ready(Some(topic_id)) = self.unsubscriptions.poll_next_unpin(cx) {
+            if self
+                .subscribed_topics
+                .get(&topic_id)
+                .is_some_and(Sender::is_closed)
+            {
+                self.subscribed_topics.remove(&topic_id);
+            }
+        }
+
         if let Some(event) = self.pending_events.pop_front() {
             return Poll::Ready(event);
         }
@@ -256,6 +278,39 @@ mod tests {
 
     fn poll(behaviour: &mut Behaviour) -> Poll<ToSwarm<Event, HandlerIn>> {
         behaviour.poll(&mut Context::from_waker(Waker::noop()))
+    }
+
+    #[test]
+    fn dropping_receiver_unsubscribes() {
+        let mut behaviour = Behaviour::new(Config::default());
+        let receiver = behaviour.subscribe(TOPIC.to_vec()).unwrap();
+        assert!(behaviour.subscribe(TOPIC.to_vec()).is_none());
+
+        drop(receiver);
+        assert!(poll(&mut behaviour).is_pending());
+        assert!(behaviour.subscribed_topics.is_empty());
+        assert!(behaviour.subscribe(TOPIC.to_vec()).is_some());
+    }
+
+    #[test]
+    fn subscribing_again_before_poll() {
+        let mut behaviour = Behaviour::new(Config::default());
+        drop(behaviour.subscribe(TOPIC.to_vec()).unwrap());
+        let _receiver = behaviour.subscribe(TOPIC.to_vec()).unwrap();
+
+        // The dropped receiver does not end the new subscription.
+        assert!(poll(&mut behaviour).is_pending());
+        assert!(behaviour.subscribe(TOPIC.to_vec()).is_none());
+    }
+
+    #[test]
+    fn dropped_subscription_is_not_sent_to_new_connections() {
+        let mut behaviour = Behaviour::new(Config::default());
+        drop(behaviour.subscribe(TOPIC.to_vec()).unwrap());
+
+        // The connection is established before `poll` forgets the topic.
+        behaviour.on_connection_established(ConnectionId::new_unchecked(0), PeerId::random());
+        assert!(poll(&mut behaviour).is_pending());
     }
 
     #[test]
