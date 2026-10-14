@@ -20,13 +20,14 @@
 
 use std::{
     collections::{HashSet, VecDeque},
+    pin::Pin,
     sync::Arc,
     sync::atomic::AtomicUsize,
     task::{Context, Poll},
 };
 
 use async_channel::{Sender, unbounded};
-use futures::{StreamExt, stream::FuturesUnordered};
+use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use libp2p::{
     PeerId,
     swarm::{
@@ -73,6 +74,30 @@ pub enum Event {
     /// an error occurred, the connection closed, or every `sender` was
     /// dropped.
     Unsubscribed { topic_id: Vec<u8> },
+    /// The connection closed while one of our subscription streams still
+    /// owed the application topic events, at least its
+    /// [`TopicEvent::Closed`]. The behaviour drives the delivery, so a full
+    /// channel does not hold up the connection's shutdown.
+    Undelivered(Delivery),
+}
+
+/// The delivery of the topic events a subscription stream still owed the
+/// application when its connection closed. Completes once they are all
+/// delivered, or the channel closed.
+pub struct Delivery(pub(crate) BoxFuture<'static, ()>);
+
+impl std::fmt::Debug for Delivery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Delivery").finish_non_exhaustive()
+    }
+}
+
+impl Future for Delivery {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.0.as_mut().poll(cx)
+    }
 }
 
 /// A message on the channel of a topic we subscribed to.
@@ -253,10 +278,16 @@ impl ConnectionHandler for Handler {
             .extend(self.inbound_subscriptions.drain().map(|topic_id| {
                 ConnectionHandlerEvent::NotifyBehaviour(Event::Unsubscribed { topic_id })
             }));
-        // Our subscriptions end with the connection too.
-        for outbound in std::mem::take(&mut self.outbound_substreams) {
-            outbound.close();
-        }
+        // Our subscriptions end with the connection too. The behaviour
+        // delivers what their streams still owe the application.
+        self.pending_events.extend(
+            std::mem::take(&mut self.outbound_substreams)
+                .into_iter()
+                .filter_map(Outbound::into_delivery)
+                .map(|delivery| {
+                    ConnectionHandlerEvent::NotifyBehaviour(Event::Undelivered(delivery))
+                }),
+        );
 
         while let Some(event) = self.pending_events.pop_front() {
             if let ConnectionHandlerEvent::NotifyBehaviour(event) = event {

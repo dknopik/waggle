@@ -30,16 +30,17 @@ use futures::{AsyncWriteExt, Sink, Stream, StreamExt};
 use libp2p::Stream as Libp2pStream;
 use libp2p::{PeerId, swarm::ConnectionId};
 
-use crate::handler::{ObjectPieces, TopicEvent};
+use crate::handler::{Delivery, ObjectPieces, TopicEvent};
 use crate::protocol::{PieceCodec, proto};
 
 /// A per-topic outbound subscription stream.
 ///
 /// Forwards the pieces of one topic read from our subscription stream to the
 /// topic's channel, between a [`TopicEvent::Opened`] and a
-/// [`TopicEvent::Closed`]. Completes once the stream ended, or once the
-/// channel closed and the stream with it: the application dropped the
-/// receiver, unsubscribing from the topic.
+/// [`TopicEvent::Closed`]. Stops reading while a message waits for room in
+/// the channel. Completes once the stream ended and the `Closed` was
+/// delivered, or once the channel closed and the stream with it: the
+/// application dropped the receiver, unsubscribing from the topic.
 pub struct Outbound {
     topic: Vec<u8>,
     /// The remote peer of the stream.
@@ -50,6 +51,9 @@ pub struct Outbound {
     sender: Sender<TopicEvent>,
     /// Resolves when the channel closes.
     unsubscribed: BoxFuture<'static, ()>,
+    /// The message waiting for room in the channel. Resolves to `false` when
+    /// the channel closes.
+    delivery: Option<BoxFuture<'static, bool>>,
     state: OutboundState,
 }
 
@@ -60,6 +64,7 @@ impl std::fmt::Debug for Outbound {
             .field("peer_id", &self.peer_id)
             .field("connection_id", &self.connection_id)
             .field("sender", &self.sender)
+            .field("delivering", &self.delivery.is_some())
             .field("state", &self.state)
             .finish_non_exhaustive()
     }
@@ -86,6 +91,7 @@ impl Outbound {
             connection_id,
             sender,
             unsubscribed: Box::pin(async move { watched.closed().await }),
+            delivery: None,
             state: OutboundState::Active(framed),
         };
         outbound.deliver(TopicEvent::Opened {
@@ -95,18 +101,25 @@ impl Outbound {
         outbound
     }
 
-    /// Delivers `event` on the topic's channel.
+    /// Delivers `event` on the topic's channel, or keeps it until the channel
+    /// has room.
     fn deliver(&mut self, event: TopicEvent) {
-        // The channel is unbounded, so it only rejects the event once closed.
-        if self.sender.try_send(event).is_err() {
-            self.unsubscribe();
+        match self.sender.try_send(event) {
+            Ok(()) => {}
+            // Stop reading until the application makes room.
+            Err(TrySendError::Full(event)) => {
+                let sender = self.sender.clone();
+                self.delivery = Some(Box::pin(async move { sender.send(event).await.is_ok() }));
+            }
+            Err(TrySendError::Closed(_)) => self.unsubscribe(),
         }
     }
 
-    /// The channel closed: the application unsubscribed. Closes the stream
-    /// quietly.
+    /// The channel closed: the application unsubscribed. Drops the message
+    /// waiting for room and closes the stream quietly.
     fn unsubscribe(&mut self) {
         tracing::debug!(topic = ?self.topic, "Receive channel closed");
+        self.delivery = None;
         self.close_stream();
     }
 
@@ -127,16 +140,35 @@ impl Outbound {
         };
     }
 
-    /// Ends the stream with its connection, delivering the `Closed` unless
-    /// the stream ended already.
-    pub(crate) fn close(self) {
-        if matches!(self.state, OutboundState::Active(_)) {
-            // The channel is unbounded, so this only fails once it is closed.
-            let _ = self.sender.try_send(TopicEvent::Closed {
-                peer_id: self.peer_id,
-                connection_id: self.connection_id,
-            });
+    /// Ends the stream with its connection.
+    ///
+    /// Returns the delivery of the events the application is still owed: the
+    /// message waiting for room, and the `Closed` if the stream had not ended
+    /// yet.
+    pub(crate) fn into_delivery(self) -> Option<Delivery> {
+        if self.sender.is_closed() {
+            return None;
         }
+        let closed = matches!(self.state, OutboundState::Active(_)).then_some(TopicEvent::Closed {
+            peer_id: self.peer_id,
+            connection_id: self.connection_id,
+        });
+        let Self {
+            sender, delivery, ..
+        } = self;
+        if delivery.is_none() && closed.is_none() {
+            return None;
+        }
+        Some(Delivery(Box::pin(async move {
+            if let Some(delivery) = delivery
+                && !delivery.await
+            {
+                return;
+            }
+            if let Some(closed) = closed {
+                let _ = sender.send(closed).await;
+            }
+        })))
     }
 }
 
@@ -174,8 +206,22 @@ impl Future for Outbound {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         loop {
+            // Deliver the message waiting for room first: nothing is read
+            // until it is delivered.
+            if let Some(delivery) = &mut this.delivery {
+                match delivery.as_mut().poll(cx) {
+                    Poll::Ready(true) => this.delivery = None,
+                    Poll::Ready(false) => this.unsubscribe(),
+                    Poll::Pending => {}
+                }
+            }
+
             match &mut this.state {
                 OutboundState::Active(framed) => {
+                    if this.delivery.is_some() {
+                        return Poll::Pending;
+                    }
+
                     // The application dropped the receiver: close the stream
                     // without waiting for the next piece.
                     if this.unsubscribed.as_mut().poll(cx).is_ready() {
@@ -208,6 +254,8 @@ impl Future for Outbound {
                     }
                     this.state = OutboundState::Closed;
                 }
+                // Done once the `Closed` is delivered.
+                OutboundState::Closed if this.delivery.is_some() => return Poll::Pending,
                 OutboundState::Closed => return Poll::Ready(()),
             }
         }

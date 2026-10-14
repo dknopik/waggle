@@ -18,12 +18,13 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, num::NonZeroUsize, sync::Arc};
 
 /// Configuration for a Waggle protocol instance.
 #[derive(Debug, Clone)]
 pub struct Config {
     max_connection_queue_limit: usize,
+    max_receive_queue_len: NonZeroUsize,
     max_topic_subscription: usize,
     max_protobuf_size: usize,
     pub(crate) topic_whitelist: Option<Arc<HashSet<Vec<u8>>>>,
@@ -50,6 +51,25 @@ impl Config {
     /// Sets the maximum number of messages queued outbound on one connection.
     pub fn set_max_connection_queue_limit(mut self, len: usize) -> Self {
         self.max_connection_queue_limit = len;
+        self
+    }
+
+    /// The maximum number of received messages buffered for the application
+    /// on one subscribed topic.
+    ///
+    /// The buffer is shared by all the peers we subscribed to on the topic.
+    /// When it is full, reading from them pauses until the application
+    /// drains the receiver.
+    ///
+    /// Defaults to 100.
+    pub fn max_receive_queue_len(&self) -> NonZeroUsize {
+        self.max_receive_queue_len
+    }
+
+    /// Sets the maximum number of received messages buffered for the
+    /// application on one subscribed topic.
+    pub fn set_max_receive_queue_len(mut self, len: NonZeroUsize) -> Self {
+        self.max_receive_queue_len = len;
         self
     }
 
@@ -97,6 +117,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             max_connection_queue_limit: 5000,
+            max_receive_queue_len: NonZeroUsize::new(100).expect("100 is non-zero"),
             max_topic_subscription: 50,
             topic_whitelist: None,
             max_protobuf_size: 65536,

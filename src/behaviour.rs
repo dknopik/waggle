@@ -35,7 +35,7 @@ use libp2p::{
 
 use crate::{
     config::Config,
-    handler::{self, HandlerIn, PieceSender, TopicEvent},
+    handler::{self, Delivery, HandlerIn, PieceSender, TopicEvent},
 };
 
 /// Event emitted by the waggle behaviour.
@@ -89,6 +89,8 @@ pub struct Behaviour {
     /// Resolve with their topic when the application drops a topic's
     /// receiver.
     unsubscriptions: FuturesUnordered<BoxFuture<'static, Vec<u8>>>,
+    /// The topic events closed connections still owe the application.
+    deliveries: FuturesUnordered<Delivery>,
 }
 
 impl Behaviour {
@@ -100,6 +102,7 @@ impl Behaviour {
             connections: HashMap::new(),
             subscribed_topics: HashMap::new(),
             unsubscriptions: FuturesUnordered::new(),
+            deliveries: FuturesUnordered::new(),
         }
     }
 
@@ -121,7 +124,7 @@ impl Behaviour {
             return None;
         }
 
-        let (sender, receiver) = async_channel::unbounded();
+        let (sender, receiver) = async_channel::bounded(self.config.max_receive_queue_len().get());
         // Hand every connection a clone of the topic's sender.
         for (connection_id, peer_id) in &self.connections {
             self.pending_events.push_back(ToSwarm::NotifyHandler {
@@ -238,6 +241,10 @@ impl NetworkBehaviour for Behaviour {
                 connection_id,
                 topic_id,
             },
+            handler::Event::Undelivered(delivery) => {
+                self.deliveries.push(delivery);
+                return;
+            }
         };
         self.pending_events.push_back(ToSwarm::GenerateEvent(event));
     }
@@ -257,6 +264,10 @@ impl NetworkBehaviour for Behaviour {
                 self.subscribed_topics.remove(&topic_id);
             }
         }
+
+        // Drive the deliveries of closed connections, dropping the ones that
+        // completed.
+        while let Poll::Ready(Some(())) = self.deliveries.poll_next_unpin(cx) {}
 
         if let Some(event) = self.pending_events.pop_front() {
             return Poll::Ready(event);
