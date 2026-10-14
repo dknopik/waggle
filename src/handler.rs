@@ -25,7 +25,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use async_channel::{Receiver, Sender, unbounded};
+use async_channel::{Receiver, unbounded};
 use futures::{
     StreamExt,
     stream::{FuturesUnordered, SelectAll},
@@ -43,6 +43,8 @@ use crate::{
     protocol::{InboundProtocol, OutboundProtocol, proto},
     substream::{Inbound, Outbound},
 };
+
+pub use crate::substream::{PieceSender, SendError};
 
 /// Instructions from the behaviour to the handler for managing topic streams.
 #[derive(Debug)]
@@ -62,32 +64,56 @@ pub enum HandlerIn {
 #[derive(Debug)]
 pub enum Event {
     /// The remote peer sent a valid subscription.
-    /// `Sender` used by the behaviour to dispatch messages to the remote.
+    /// `sender` queues pieces for the remote on this subscription.
     Subscribed {
         topic_id: Vec<u8>,
-        sender: Sender<proto::ObjectPieces>,
+        sender: PieceSender,
     },
     /// A message with object pieces was received.
-    Received(Received),
-    /// The remote peer closed the stream (or an error occurred).
+    Received {
+        topic_id: Vec<u8>,
+        pieces: ObjectPieces,
+    },
+    /// The remote peer's subscription ended: the remote closed the stream,
+    /// an error occurred, or every `sender` was dropped.
     Unsubscribed { topic_id: Vec<u8> },
 }
 
-/// A set of object pieces received from a peer.
-#[derive(Debug, Clone)]
-pub struct Received {
-    pub topic_id: Vec<u8>,
+/// A set of object pieces of one object, exchanged with a peer on a topic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectPieces {
     pub object_id: Vec<u8>,
     pub metadata: Option<Vec<u8>>,
     pub pieces: Option<Vec<u8>>,
+}
+
+impl From<proto::ObjectPieces> for ObjectPieces {
+    fn from(message: proto::ObjectPieces) -> Self {
+        Self {
+            object_id: message.object_id,
+            metadata: message.pieces_metadata,
+            pieces: message.pieces,
+        }
+    }
+}
+
+impl From<ObjectPieces> for proto::ObjectPieces {
+    fn from(pieces: ObjectPieces) -> Self {
+        Self {
+            object_id: pieces.object_id,
+            pieces_metadata: pieces.metadata,
+            pieces: pieces.pieces,
+        }
+    }
 }
 
 /// Connection-level state for the waggle protocol.
 ///
 /// Manages the topic subscription streams on one connection: the receive
 /// streams of the topics we subscribed to, and the send streams of the
-/// topics the remote peer subscribed to. Delivers events to the behaviour
-/// and enforces the inbound stream limit.
+/// topics the remote peer subscribed to. The send streams are wired directly
+/// to the senders handed to the application. Delivers events to the
+/// behaviour and enforces the inbound stream limit.
 pub struct Handler {
     /// Configuration for limits, queue sizes, and wire sizes.
     config: Config,
@@ -101,17 +127,16 @@ pub struct Handler {
     inbound_substreams: FuturesUnordered<Inbound>,
     /// The connection events to deliver to the swarm, drained in `poll`.
     pending_events: VecDeque<ConnectionHandlerEvent<OutboundProtocol, Receiver<()>, Event>>,
-    /// The per-connection outbound counter, handed to each stream writer.
+    /// The per-connection outbound counter, shared with the senders and the
+    /// stream writers.
     used: Arc<AtomicUsize>,
 }
 
 impl Handler {
     /// Creates a new `Handler` for one connection.
     ///
-    /// `used` is this connection's outbound queue counter, shared with the
-    /// senders and the stream writers. `config` holds the limits and the
-    /// wire sizes.
-    pub(crate) fn new(used: Arc<AtomicUsize>, config: Config) -> Self {
+    /// `config` holds the limits, queue sizes, and wire sizes.
+    pub(crate) fn new(config: Config) -> Self {
         Self {
             inbound_protocol: InboundProtocol::new(
                 config.max_protobuf_size(),
@@ -122,7 +147,7 @@ impl Handler {
             inbound_subscriptions: HashSet::new(),
             inbound_substreams: FuturesUnordered::new(),
             pending_events: VecDeque::new(),
-            used,
+            used: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -175,15 +200,12 @@ impl ConnectionHandler for Handler {
 
         // Then drive the send streams of the topics the remote subscribed to,
         // dropping the ones that completed.
-        while let Poll::Ready(Some(event)) = self.inbound_substreams.poll_next_unpin(cx) {
-            if let Some(Event::Unsubscribed { topic_id }) = event {
-                self.inbound_subscriptions.remove(&topic_id);
-                self.inbound_protocol.stream_closed();
-                self.pending_events
-                    .push_back(ConnectionHandlerEvent::NotifyBehaviour(
-                        Event::Unsubscribed { topic_id },
-                    ));
-            }
+        if let Poll::Ready(Some(topic_id)) = self.inbound_substreams.poll_next_unpin(cx) {
+            self.inbound_subscriptions.remove(&topic_id);
+            self.inbound_protocol.stream_closed();
+            return Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(
+                Event::Unsubscribed { topic_id },
+            ));
         }
 
         Poll::Pending
@@ -224,7 +246,8 @@ impl ConnectionHandler for Handler {
                     .insert(subscription.topic_id.clone());
 
                 // The remote subscribed to this topic: set up the stream we
-                // send the topic's pieces on.
+                // send the topic's pieces on, and hand its sender to the
+                // application.
                 let (sender, receiver) = unbounded();
                 let inbound = Inbound::new(
                     subscription.topic_id.clone(),
@@ -233,9 +256,14 @@ impl ConnectionHandler for Handler {
                     framed,
                 );
                 self.inbound_substreams.push(inbound);
+                let sender = PieceSender::new(
+                    sender,
+                    self.config.max_connection_queue_limit(),
+                    Arc::clone(&self.used),
+                );
                 self.pending_events
                     .push_back(ConnectionHandlerEvent::NotifyBehaviour(Event::Subscribed {
-                        topic_id: subscription.topic_id.clone(),
+                        topic_id: subscription.topic_id,
                         sender,
                     }));
             }

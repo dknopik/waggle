@@ -28,6 +28,9 @@
 //!
 //! - **Per-topic streams** — Each topic uses dedicated streams. Subscribing opens a
 //!   stream; unsubscribing closes it.
+//! - **Application-driven dissemination** — Each remote subscription hands the
+//!   application a sender for one peer and topic. The application decides which
+//!   pieces go to which peers.
 //! - **Application-defined scoring** — Peer scoring is left entirely to the
 //!   application. The protocol surfaces relevant events but does not bake in scoring.
 //! - **Opaque identifiers** — Topics, objects, and piece metadata are opaque to the

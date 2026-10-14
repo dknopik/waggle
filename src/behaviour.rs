@@ -20,11 +20,9 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{Arc, atomic::AtomicUsize},
     task::Poll,
 };
 
-use async_channel::Sender;
 use libp2p::{
     PeerId,
     swarm::{ConnectionClosed, ConnectionId, FromSwarm, NetworkBehaviour, NotifyHandler, ToSwarm},
@@ -32,34 +30,48 @@ use libp2p::{
 
 use crate::{
     config::Config,
-    handler::{self, HandlerIn, Received},
-    protocol::proto::ObjectPieces,
-    substream::{CloseSignal, DispatchHub},
+    handler::{self, HandlerIn, ObjectPieces, PieceSender},
+    substream::CloseSignal,
 };
 
 /// Event emitted by the waggle behaviour.
 #[derive(Debug)]
 pub enum Event {
-    /// A piece was received from a remote peer.
+    /// A remote peer sent pieces on a topic we subscribed to.
     Received {
-        /// The topic this piece belongs to.
-        topic_id: Vec<u8>,
-        /// The peer that sent this piece.
+        /// The peer that sent the pieces.
         peer_id: PeerId,
+        /// The connection the pieces arrived on.
+        connection_id: ConnectionId,
+        /// The topic the pieces belong to.
+        topic_id: Vec<u8>,
         /// The received pieces.
-        received: Received,
+        pieces: ObjectPieces,
     },
     /// A remote peer subscribed to a topic.
+    ///
+    /// Pieces queued on `sender` are written to the peer's subscription
+    /// stream on this connection.
     Subscribed {
         /// The remote peer that subscribed.
         peer_id: PeerId,
+        /// The connection the peer subscribed on.
+        connection_id: ConnectionId,
         /// The topic it subscribed to.
         topic_id: Vec<u8>,
+        /// Queues pieces for the peer on this subscription.
+        sender: PieceSender,
     },
-    /// A remote peer unsubscribed from a topic.
+    /// A remote peer's subscription to a topic ended.
+    ///
+    /// The peer unsubscribed, the stream failed, or every clone of the
+    /// subscription's `sender` was dropped. The `sender` no longer accepts
+    /// pieces.
     Unsubscribed {
         /// The remote peer that unsubscribed.
         peer_id: PeerId,
+        /// The connection the peer was subscribed on.
+        connection_id: ConnectionId,
         /// The topic it unsubscribed from.
         topic_id: Vec<u8>,
     },
@@ -71,33 +83,10 @@ pub struct Behaviour {
     config: Config,
     /// Outbound events to the swarm, drained in `poll`.
     pending_events: VecDeque<ToSwarm<Event, HandlerIn>>,
-    /// Established connections.
-    connections: HashMap<ConnectionId, Connection>,
+    /// The remote peer behind each established connection.
+    connections: HashMap<ConnectionId, PeerId>,
     /// The topics the local node is currently subscribed to.
     subscribed_topics: HashMap<Vec<u8>, CloseSignal>,
-}
-
-/// Per-connection outbound state for one established connection.
-///
-/// Holds the connection's outbound hub and the topics the remote peer
-/// subscribed to on this connection.
-#[derive(Debug)]
-struct Connection {
-    /// The remote peer behind this connection.
-    peer_id: PeerId,
-    /// The per-connection outbound hub, with its queue budget and senders.
-    hub: DispatchHub,
-}
-
-impl Connection {
-    /// Subscribes the remote connection to topic.
-    fn subscribe(&mut self, topic_id: Vec<u8>, sender: Sender<ObjectPieces>) {
-        self.hub.senders.insert(topic_id.clone(), sender);
-    }
-
-    fn unsubscribe(&mut self, topic_id: &[u8]) {
-        self.hub.senders.remove(topic_id);
-    }
 }
 
 impl Behaviour {
@@ -121,9 +110,9 @@ impl Behaviour {
 
         let close_signal = CloseSignal::new();
         // Hand every connection a receiver clone of the topic's close signal.
-        for (connection_id, connection) in &self.connections {
+        for (connection_id, peer_id) in &self.connections {
             self.pending_events.push_back(ToSwarm::NotifyHandler {
-                peer_id: connection.peer_id,
+                peer_id: *peer_id,
                 handler: NotifyHandler::One(*connection_id),
                 event: HandlerIn::Subscribe {
                     topic_id: topic_id.clone(),
@@ -149,6 +138,30 @@ impl Behaviour {
 
         true
     }
+
+    /// Tracks a newly established connection and creates its handler.
+    ///
+    /// Subscribes the connection to all the topics we are subscribed to.
+    fn on_connection_established(
+        &mut self,
+        connection_id: ConnectionId,
+        peer_id: PeerId,
+    ) -> handler::Handler {
+        self.connections.insert(connection_id, peer_id);
+
+        for (topic_id, close_signal) in &self.subscribed_topics {
+            self.pending_events.push_back(ToSwarm::NotifyHandler {
+                peer_id,
+                handler: NotifyHandler::One(connection_id),
+                event: HandlerIn::Subscribe {
+                    topic_id: topic_id.clone(),
+                    close_signal: close_signal.receiver(),
+                },
+            });
+        }
+
+        handler::Handler::new(self.config.clone())
+    }
 }
 
 impl NetworkBehaviour for Behaviour {
@@ -163,24 +176,7 @@ impl NetworkBehaviour for Behaviour {
         _local_addr: &libp2p::Multiaddr,
         _remote_addr: &libp2p::Multiaddr,
     ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
-        let used = Arc::new(AtomicUsize::new(0));
-        let hub = DispatchHub::new(self.config.max_connection_queue_limit(), Arc::clone(&used));
-        self.connections
-            .insert(connection_id, Connection { peer_id, hub });
-
-        // Subscribe this connection to all the topics we are subscribed to.
-        for (topic_id, close_signal) in &self.subscribed_topics {
-            self.pending_events.push_back(ToSwarm::NotifyHandler {
-                peer_id,
-                handler: NotifyHandler::One(connection_id),
-                event: HandlerIn::Subscribe {
-                    topic_id: topic_id.clone(),
-                    close_signal: close_signal.receiver(),
-                },
-            });
-        }
-
-        Ok(handler::Handler::new(used, self.config.clone()))
+        Ok(self.on_connection_established(connection_id, peer_id))
     }
 
     fn handle_established_outbound_connection(
@@ -191,24 +187,7 @@ impl NetworkBehaviour for Behaviour {
         _role_override: libp2p::core::Endpoint,
         _port_use: libp2p::core::transport::PortUse,
     ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
-        let used = Arc::new(AtomicUsize::new(0));
-        let hub = DispatchHub::new(self.config.max_connection_queue_limit(), Arc::clone(&used));
-        self.connections
-            .insert(connection_id, Connection { peer_id, hub });
-
-        // Subscribe this connection to all the topics we are subscribed to.
-        for (topic_id, close_signal) in &self.subscribed_topics {
-            self.pending_events.push_back(ToSwarm::NotifyHandler {
-                peer_id,
-                handler: NotifyHandler::One(connection_id),
-                event: HandlerIn::Subscribe {
-                    topic_id: topic_id.clone(),
-                    close_signal: close_signal.receiver(),
-                },
-            });
-        }
-
-        Ok(handler::Handler::new(used, self.config.clone()))
+        Ok(self.on_connection_established(connection_id, peer_id))
     }
 
     fn on_swarm_event(&mut self, event: FromSwarm) {
@@ -223,49 +202,33 @@ impl NetworkBehaviour for Behaviour {
         connection_id: libp2p::swarm::ConnectionId,
         event: libp2p::swarm::THandlerOutEvent<Self>,
     ) {
-        match event {
-            handler::Event::Subscribed { topic_id, sender } => {
-                let Some(connection) = self.connections.get_mut(&connection_id) else {
-                    tracing::error!("Subscription from an Unknown connection");
-                    return;
-                };
-
-                connection.subscribe(topic_id.clone(), sender);
-                self.pending_events
-                    .push_back(ToSwarm::GenerateEvent(Event::Subscribed {
-                        peer_id,
-                        topic_id,
-                    }))
-            }
-            handler::Event::Received(received) => {
+        let event = match event {
+            handler::Event::Subscribed { topic_id, sender } => Event::Subscribed {
+                peer_id,
+                connection_id,
+                topic_id,
+                sender,
+            },
+            handler::Event::Received { topic_id, pieces } => {
                 // Ignore pieces for a topic the local node is not subscribed to.
-                if !self.subscribed_topics.contains_key(&received.topic_id) {
+                if !self.subscribed_topics.contains_key(&topic_id) {
                     tracing::debug!(peer_id=%peer_id, "Received piece for an unsubscribed topic");
                     return;
                 }
-
-                self.pending_events
-                    .push_back(ToSwarm::GenerateEvent(Event::Received {
-                        topic_id: received.topic_id.clone(),
-                        peer_id,
-                        received,
-                    }));
+                Event::Received {
+                    peer_id,
+                    connection_id,
+                    topic_id,
+                    pieces,
+                }
             }
-
-            handler::Event::Unsubscribed { topic_id } => {
-                let Some(connection) = self.connections.get_mut(&connection_id) else {
-                    tracing::error!("Unsubscription from an Unknown connection");
-                    return;
-                };
-
-                connection.unsubscribe(&topic_id);
-                self.pending_events
-                    .push_back(ToSwarm::GenerateEvent(Event::Unsubscribed {
-                        peer_id,
-                        topic_id,
-                    }));
-            }
-        }
+            handler::Event::Unsubscribed { topic_id } => Event::Unsubscribed {
+                peer_id,
+                connection_id,
+                topic_id,
+            },
+        };
+        self.pending_events.push_back(ToSwarm::GenerateEvent(event));
     }
 
     fn poll(
