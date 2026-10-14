@@ -32,7 +32,15 @@ pub struct Config {
 impl Config {
     /// The maximum number of messages queued outbound on one connection.
     ///
-    /// When the connection queue is full, no further messages are sent.
+    /// The budget is shared by all the [`PieceSender`](crate::handler::PieceSender)s
+    /// of the connection. When the connection queue is full, they reject
+    /// further messages with [`SendError::Full`](crate::handler::SendError::Full).
+    ///
+    /// Since the budget is shared, `Full` means the peer as a whole is not
+    /// keeping up, not that a single topic is full. Messages queued on a
+    /// topic the peer stopped reading keep their share of the budget until
+    /// the stream closes, so a stall on one topic eventually rejects sends
+    /// on every topic of the connection.
     ///
     /// Defaults to 5000.
     pub fn max_connection_queue_limit(&self) -> usize {

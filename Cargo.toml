@@ -23,3 +23,8 @@ prost = "0.14"
 prost-codec = { git = "https://github.com/libp2p/rust-libp2p" }
 thiserror = "2.0.20"
 tracing = "0.1"
+
+[dev-dependencies]
+libp2p = { version = "0.56.0", features = ["ed25519", "plaintext", "tokio", "yamux"] }
+rand = "0.10"
+tokio = { version = "1", features = ["macros", "rt", "time"] }

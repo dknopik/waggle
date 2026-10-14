@@ -17,20 +17,25 @@
 // OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::task::{Context, Poll};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    task::{Context, Poll},
+};
 
 use async_channel::{Receiver, Sender, TrySendError, bounded};
 use asynchronous_codec::Framed;
 use futures::{AsyncWriteExt, Sink, Stream, StreamExt};
 use libp2p::Stream as Libp2pStream;
 
-use crate::handler::{Event, Received};
-use crate::protocol::{PieceCodec, proto};
+use crate::{
+    handler::{Event, ObjectPieces},
+    protocol::{PieceCodec, proto},
+};
 
 /// A per-topic outbound subscription stream.
 ///
@@ -109,14 +114,12 @@ impl Stream for Outbound {
 
                     match framed.poll_next_unpin(cx) {
                         Poll::Ready(Some(result)) => match result {
-                            Ok(piece) => {
+                            Ok(pieces) => {
                                 this.state = OutboundState::Active(framed);
-                                return Poll::Ready(Some(Event::Received(Received {
+                                return Poll::Ready(Some(Event::Received {
                                     topic_id: this.topic.clone(),
-                                    object_id: piece.object_id,
-                                    metadata: piece.pieces_metadata,
-                                    pieces: piece.pieces,
-                                })));
+                                    pieces: pieces.into(),
+                                }));
                             }
                             Err(err) => {
                                 // TODO: Report a protocol violation when data is invalid?
@@ -194,64 +197,66 @@ impl CloseSignal {
         self.receiver.clone()
     }
 }
-/// Errors from the outbound hub when dispatching a message.
+/// Errors from a [`PieceSender`] when queuing pieces for a peer.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum SendError {
+pub enum SendError {
     /// The connection's outbound queue reached its limit.
+    ///
+    /// The limit is shared by all topics on the connection, so this signals
+    /// that the peer as a whole is not keeping up, not that this topic is
+    /// full. See
+    /// [`Config::max_connection_queue_limit`](crate::config::Config::max_connection_queue_limit).
     #[error("connection outbound queue full")]
     Full,
-    /// The channel for the topic is closed.
+    /// The peer's subscription stream is closed.
     #[error("outbound channel closed")]
     Closed,
-    /// There is no outbound stream for the topic.
-    #[error("no outbound stream for the topic")]
-    UnknownTopic,
 }
 
-/// Per-connection dispatcher for outbound piece messages.
+/// Queues object pieces for a remote peer subscribed to a topic.
 ///
-/// Routes the published pieces to the topic's stream writers under one
-/// connection-wide queue budget.
-#[derive(Debug)]
-pub(crate) struct DispatchHub {
+/// Handed to the application for every remote subscription. The pieces are
+/// written to the subscription stream the peer opened. All senders on a
+/// connection share one queue budget of
+/// [`Config::max_connection_queue_limit`](crate::config::Config::max_connection_queue_limit)
+/// messages.
+#[derive(Debug, Clone)]
+pub struct PieceSender {
+    /// The topic's outbound channel, drained by the stream writer.
+    sender: Sender<proto::ObjectPieces>,
     /// The connection's outbound queue limit.
     limit: usize,
     /// The number of messages currently queued on the connection, shared with
-    /// the outbound receivers.
+    /// the other senders and the stream writers.
     used: Arc<AtomicUsize>,
-    /// The per-topic senders, keyed by topic.
-    pub(crate) senders: HashMap<Vec<u8>, Sender<proto::ObjectPieces>>,
 }
 
-impl DispatchHub {
-    /// Creates an empty hub with the given queue `limit`.
-    pub(crate) fn new(limit: usize, used: Arc<AtomicUsize>) -> Self {
+impl PieceSender {
+    /// Creates a sender for the outbound channel `sender` with the given
+    /// connection queue `limit`.
+    pub(crate) fn new(
+        sender: Sender<proto::ObjectPieces>,
+        limit: usize,
+        used: Arc<AtomicUsize>,
+    ) -> Self {
         Self {
+            sender,
             limit,
             used,
-            senders: HashMap::new(),
         }
     }
 
-    /// Queues `message` on the outbound channel for `topic`.
+    /// Queues `pieces` for the peer.
     ///
-    /// Returns `Full` when the connection's queue reached its limit, `Closed`
-    /// when the channel is closed, and `UnknownTopic` when there is no
-    /// channel for the topic.
-    pub(crate) fn try_send(
-        &self,
-        topic: &[u8],
-        message: proto::ObjectPieces,
-    ) -> Result<(), SendError> {
-        let Some(sender) = self.senders.get(topic) else {
-            return Err(SendError::UnknownTopic);
-        };
+    /// Returns `Full` when the connection's queue reached its limit and
+    /// `Closed` when the subscription stream is closed.
+    pub fn try_send(&self, pieces: ObjectPieces) -> Result<(), SendError> {
         let n = self.used.fetch_add(1, Ordering::SeqCst);
         if n >= self.limit {
             self.used.fetch_sub(1, Ordering::SeqCst);
             return Err(SendError::Full);
         }
-        match sender.try_send(message) {
+        match self.sender.try_send(pieces.into()) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => {
                 self.used.fetch_sub(1, Ordering::SeqCst);
@@ -269,9 +274,8 @@ impl DispatchHub {
 ///
 /// Reads the messages of one topic from its channel and writes them to the
 /// subscription stream the remote peer opened for that topic. The future
-/// completes when the channel closes or a write fails. It completes with
-/// `Some(Unsubscribed)` when the remote closed the stream, or `None` when
-/// the local side stopped it.
+/// completes with the topic when every sender of the channel is dropped or
+/// a write fails.
 pub struct Inbound {
     topic: Vec<u8>,
     receiver: Pin<Box<Receiver<proto::ObjectPieces>>>,
@@ -306,6 +310,8 @@ impl Drop for Inbound {
     fn drop(&mut self) {
         // Messages left buffered in the channel were counted on push but never
         // popped; release their budget so the connection's counter stays exact.
+        // Close the channel first so no sender pushes after the count.
+        self.receiver.close();
         self.used.fetch_sub(self.receiver.len(), Ordering::SeqCst);
     }
 }
@@ -324,7 +330,7 @@ enum InboundState {
 }
 
 impl Future for Inbound {
-    type Output = Option<Event>;
+    type Output = Vec<u8>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
@@ -340,7 +346,7 @@ impl Future for Inbound {
                     Poll::Ready(None) => {
                         tracing::debug!(topic = ?this.topic, "Outbound channel closed");
                         this.state = InboundState::Closed;
-                        return Poll::Ready(None);
+                        return Poll::Ready(this.topic.clone());
                     }
                     Poll::Pending => {
                         this.state = InboundState::WaitingMessage;
@@ -358,18 +364,14 @@ impl Future for Inbound {
                                         "Failed to send message on inbound stream: {err}"
                                     );
                                     this.state = InboundState::Closed;
-                                    return Poll::Ready(Some(Event::Unsubscribed {
-                                        topic_id: this.topic.clone(),
-                                    }));
+                                    return Poll::Ready(this.topic.clone());
                                 }
                             }
                         }
                         Poll::Ready(Err(err)) => {
                             tracing::debug!(topic = ?this.topic, "Inbound stream error: {err}");
                             this.state = InboundState::Closed;
-                            return Poll::Ready(Some(Event::Unsubscribed {
-                                topic_id: this.topic.clone(),
-                            }));
+                            return Poll::Ready(this.topic.clone());
                         }
                         Poll::Pending => {
                             this.state = InboundState::WaitingReady { message };
@@ -385,16 +387,14 @@ impl Future for Inbound {
                             "Failed to flush inbound stream: {err}"
                         );
                         this.state = InboundState::Closed;
-                        return Poll::Ready(Some(Event::Unsubscribed {
-                            topic_id: this.topic.clone(),
-                        }));
+                        return Poll::Ready(this.topic.clone());
                     }
                     Poll::Pending => {
                         this.state = InboundState::Flushing;
                         return Poll::Pending;
                     }
                 },
-                InboundState::Closed => return Poll::Ready(None),
+                InboundState::Closed => return Poll::Ready(this.topic.clone()),
                 InboundState::Poisoned => {
                     panic!("entered poisoned inbound stream state")
                 }
