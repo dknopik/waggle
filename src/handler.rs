@@ -21,11 +21,10 @@
 use std::{
     collections::{HashSet, VecDeque},
     pin::Pin,
-    sync::{Arc, atomic::AtomicUsize},
     task::{Context, Poll},
 };
 
-use async_channel::{Sender, unbounded};
+use async_channel::{Sender, bounded};
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use libp2p::{
     PeerId,
@@ -38,7 +37,7 @@ use libp2p::{
     },
 };
 
-pub use crate::substream::{PieceSender, SendError};
+pub use crate::substream::PieceSender;
 use crate::{
     config::Config,
     protocol::{InboundProtocol, OutboundProtocol, proto},
@@ -183,9 +182,6 @@ pub struct Handler {
     inbound_substreams: FuturesUnordered<Inbound>,
     /// The connection events to deliver to the swarm, drained in `poll`.
     pending_events: VecDeque<ConnectionHandlerEvent<OutboundProtocol, Sender<TopicEvent>, Event>>,
-    /// The per-connection outbound counter, shared with the senders and the
-    /// stream writers.
-    used: Arc<AtomicUsize>,
 }
 
 impl Handler {
@@ -206,7 +202,6 @@ impl Handler {
             inbound_subscriptions: HashSet::new(),
             inbound_substreams: FuturesUnordered::new(),
             pending_events: VecDeque::new(),
-            used: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -332,19 +327,12 @@ impl ConnectionHandler for Handler {
                 // The remote subscribed to this topic: set up the stream we
                 // send the topic's pieces on, and hand its sender to the
                 // application.
-                let (sender, receiver) = unbounded();
-                let inbound = Inbound::new(
+                let (sender, receiver) = bounded(self.config.max_send_queue_limit().get());
+                self.inbound_substreams.push(Inbound::new(
                     subscription.topic_id.clone(),
                     receiver,
-                    Arc::clone(&self.used),
                     framed,
-                );
-                self.inbound_substreams.push(inbound);
-                let sender = PieceSender::new(
-                    sender,
-                    self.config.max_connection_queue_limit(),
-                    Arc::clone(&self.used),
-                );
+                ));
                 self.pending_events
                     .push_back(ConnectionHandlerEvent::NotifyBehaviour(Event::Subscribed {
                         topic_id: subscription.topic_id,

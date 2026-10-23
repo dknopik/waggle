@@ -23,7 +23,7 @@ use std::{collections::HashSet, num::NonZeroUsize, sync::Arc};
 /// Configuration for a Waggle protocol instance.
 #[derive(Debug, Clone)]
 pub struct Config {
-    max_connection_queue_limit: usize,
+    max_send_queue_limit: NonZeroUsize,
     max_receive_queue_len: NonZeroUsize,
     max_topic_subscription: usize,
     max_protobuf_size: usize,
@@ -31,26 +31,22 @@ pub struct Config {
 }
 
 impl Config {
-    /// The maximum number of messages queued outbound on one connection.
+    /// The maximum number of messages queued for sending to one peer on one
+    /// topic.
     ///
-    /// The budget is shared by all the [`PieceSender`](crate::handler::PieceSender)s
-    /// of the connection. When the connection queue is full, they reject
-    /// further messages with [`SendError::Full`](crate::handler::SendError::Full).
+    /// When the queue is full, the topic's
+    /// [`PieceSender`](crate::handler::PieceSender) rejects further messages
+    /// with [`TrySendError::Full`](async_channel::TrySendError::Full).
     ///
-    /// Since the budget is shared, `Full` means the peer as a whole is not
-    /// keeping up, not that a single topic is full. Messages queued on a
-    /// topic the peer stopped reading keep their share of the budget until
-    /// the stream closes, so a stall on one topic eventually rejects sends
-    /// on every topic of the connection.
-    ///
-    /// Defaults to 5000.
-    pub fn max_connection_queue_limit(&self) -> usize {
-        self.max_connection_queue_limit
+    /// Defaults to 100.
+    pub fn max_send_queue_limit(&self) -> NonZeroUsize {
+        self.max_send_queue_limit
     }
 
-    /// Sets the maximum number of messages queued outbound on one connection.
-    pub fn set_max_connection_queue_limit(mut self, len: usize) -> Self {
-        self.max_connection_queue_limit = len;
+    /// Sets the maximum number of messages queued for sending to one peer on
+    /// one topic.
+    pub fn set_max_send_queue_limit(mut self, len: NonZeroUsize) -> Self {
+        self.max_send_queue_limit = len;
         self
     }
 
@@ -116,7 +112,7 @@ impl Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            max_connection_queue_limit: 5000,
+            max_send_queue_limit: NonZeroUsize::new(100).expect("100 is non-zero"),
             max_receive_queue_len: NonZeroUsize::new(100).expect("100 is non-zero"),
             max_topic_subscription: 50,
             topic_whitelist: None,

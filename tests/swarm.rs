@@ -4,7 +4,7 @@
 
 use std::{num::NonZeroUsize, time::Duration};
 
-use async_channel::{Receiver, Sender};
+use async_channel::{Receiver, Sender, TrySendError};
 use futures::StreamExt;
 use libp2p::{
     Multiaddr, PeerId, Swarm, SwarmBuilder,
@@ -16,7 +16,7 @@ use libp2p::{
 use waggle::{
     behaviour::{Behaviour, Event},
     config::Config,
-    handler::{ObjectPieces, PieceSender, SendError, TopicEvent},
+    handler::{ObjectPieces, PieceSender, TopicEvent},
 };
 
 const TOPIC: &[u8] = b"topic";
@@ -244,9 +244,9 @@ async fn pieces_flow_both_ways() {
     let b = Node::spawn(Config::default());
     let (a_b, b_a) = connect(&a, &b).await;
 
-    a_b.try_send(pieces(1)).unwrap();
+    a_b.try_send(pieces(1).into()).unwrap();
     assert_eq!(b.recv(a.peer_id).await, pieces(1));
-    b_a.try_send(pieces(2)).unwrap();
+    b_a.try_send(pieces(2).into()).unwrap();
     assert_eq!(a.recv(b.peer_id).await, pieces(2));
 
     a.no_event().await;
@@ -261,42 +261,42 @@ async fn pieces_from_all_peers_share_the_receiver() {
     let (_a_b, b_a) = connect(&a, &b).await;
     let (_a_c, c_a) = connect(&a, &c).await;
 
-    b_a.try_send(pieces(1)).unwrap();
+    b_a.try_send(pieces(1).into()).unwrap();
     assert_eq!(a.recv(b.peer_id).await, pieces(1));
-    c_a.try_send(pieces(2)).unwrap();
+    c_a.try_send(pieces(2).into()).unwrap();
     assert_eq!(a.recv(c.peer_id).await, pieces(2));
 }
 
 #[tokio::test]
 async fn full_receive_queue_pauses_reading() {
-    let a = Node::spawn(Config::default().set_max_connection_queue_limit(10));
+    let a = Node::spawn(Config::default().set_max_send_queue_limit(NonZeroUsize::new(10).unwrap()));
     let b = Node::spawn(Config::default().set_max_receive_queue_len(NonZeroUsize::new(2).unwrap()));
     let (a_b, _b_a) = connect(&a, &b).await;
 
     // B stops reading once its receive queue is full. The transport's
-    // buffers fill next, then A's connection queue, which stays full instead
-    // of draining. A queue full for a short while only means A sent faster
-    // than its writer drains.
+    // buffers fill next, then A's send queue, which stays full instead of
+    // draining. A queue full for a short while only means A sent faster than
+    // its writer drains.
     let mut sent = 0;
     let mut full_polls = 0;
     tokio::time::timeout(TIMEOUT, async {
         while full_polls < 30 {
-            match a_b.try_send(large_pieces(sent)) {
+            match a_b.try_send(large_pieces(sent).into()) {
                 Ok(()) => {
                     sent += 1;
                     full_polls = 0;
                     tokio::task::yield_now().await;
                 }
-                Err(SendError::Full) => {
+                Err(TrySendError::Full(_)) => {
                     full_polls += 1;
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                Err(SendError::Closed) => panic!("subscription closed"),
+                Err(TrySendError::Closed(_)) => panic!("subscription closed"),
             }
         }
     })
     .await
-    .expect("connection queue did not stay full");
+    .expect("send queue did not stay full");
     assert!(b.topic().is_full());
 
     // Draining the queue resumes reading, without losing pieces.
@@ -306,22 +306,25 @@ async fn full_receive_queue_pauses_reading() {
 }
 
 #[tokio::test]
-async fn connection_queue_limit() {
-    let a = Node::spawn(Config::default().set_max_connection_queue_limit(3));
+async fn send_queue_limit() {
+    let a = Node::spawn(Config::default().set_max_send_queue_limit(NonZeroUsize::new(3).unwrap()));
     let b = Node::spawn(Config::default());
     let (a_b, _b_a) = connect(&a, &b).await;
 
     // Nothing runs between these sends on the current-thread runtime.
     for i in 0..3 {
-        a_b.try_send(pieces(i)).unwrap();
+        a_b.try_send(pieces(i).into()).unwrap();
     }
-    assert!(matches!(a_b.try_send(pieces(3)), Err(SendError::Full)));
+    assert!(matches!(
+        a_b.try_send(pieces(3).into()),
+        Err(TrySendError::Full(_))
+    ));
     for i in 0..3 {
         assert_eq!(b.recv(a.peer_id).await, pieces(i));
     }
 
-    // The writer released the budget as it drained the queue.
-    a_b.try_send(pieces(4)).unwrap();
+    // The writer made room as it drained the queue.
+    a_b.try_send(pieces(4).into()).unwrap();
     assert_eq!(b.recv(a.peer_id).await, pieces(4));
 }
 
@@ -333,10 +336,13 @@ async fn dropping_receiver_unsubscribes() {
 
     b.unsubscribe();
     a.unsubscribed(b.peer_id).await;
-    assert!(matches!(a_b.try_send(pieces(0)), Err(SendError::Closed)));
+    assert!(matches!(
+        a_b.try_send(pieces(0).into()),
+        Err(TrySendError::Closed(_))
+    ));
 
     // A's subscription to B is untouched.
-    b_a.try_send(pieces(1)).unwrap();
+    b_a.try_send(pieces(1).into()).unwrap();
     assert_eq!(a.recv(b.peer_id).await, pieces(1));
 }
 
@@ -353,7 +359,7 @@ async fn subscribing_again_after_dropping_receiver() {
     b.subscribe().await;
     let a_b = a.subscribed(b.peer_id).await;
     b.opened(a.peer_id).await;
-    a_b.try_send(pieces(0)).unwrap();
+    a_b.try_send(pieces(0).into()).unwrap();
     assert_eq!(b.recv(a.peer_id).await, pieces(0));
 }
 
@@ -365,7 +371,7 @@ async fn dropping_sender_ends_subscription() {
 
     // The piece fills B's receive queue, so the end of the stream waits for
     // room behind it.
-    a_b.try_send(pieces(0)).unwrap();
+    a_b.try_send(pieces(0).into()).unwrap();
     drop(a_b);
     a.unsubscribed(b.peer_id).await;
     assert_eq!(b.recv(a.peer_id).await, pieces(0));
@@ -386,8 +392,14 @@ async fn connection_close_ends_everything() {
     a.no_event().await;
     b.no_event().await;
 
-    assert!(matches!(a_b.try_send(pieces(0)), Err(SendError::Closed)));
-    assert!(matches!(b_a.try_send(pieces(0)), Err(SendError::Closed)));
+    assert!(matches!(
+        a_b.try_send(pieces(0).into()),
+        Err(TrySendError::Closed(_))
+    ));
+    assert!(matches!(
+        b_a.try_send(pieces(0).into()),
+        Err(TrySendError::Closed(_))
+    ));
 }
 
 #[tokio::test]
@@ -397,8 +409,8 @@ async fn connection_close_delivers_waiting_pieces() {
     let (a_b, _b_a) = connect(&a, &b).await;
 
     // The first piece fills B's receive queue, the second waits for room.
-    a_b.try_send(pieces(0)).unwrap();
-    a_b.try_send(pieces(1)).unwrap();
+    a_b.try_send(pieces(0).into()).unwrap();
+    a_b.try_send(pieces(1).into()).unwrap();
     tokio::time::timeout(TIMEOUT, async {
         while !b.topic().is_full() {
             tokio::time::sleep(Duration::from_millis(10)).await;

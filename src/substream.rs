@@ -20,10 +20,6 @@
 use std::{
     future::Future,
     pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
     task::{Context, Poll},
 };
 
@@ -33,7 +29,7 @@ use futures::{AsyncWriteExt, Sink, Stream, StreamExt, future::BoxFuture};
 use libp2p::{PeerId, Stream as Libp2pStream, swarm::ConnectionId};
 
 use crate::{
-    handler::{Delivery, ObjectPieces, TopicEvent},
+    handler::{Delivery, TopicEvent},
     protocol::{PieceCodec, proto},
 };
 
@@ -266,78 +262,13 @@ impl Future for Outbound {
     }
 }
 
-/// Errors from a [`PieceSender`] when queuing pieces for a peer.
-#[derive(Debug, thiserror::Error)]
-pub enum SendError {
-    /// The connection's outbound queue reached its limit.
-    ///
-    /// The limit is shared by all topics on the connection, so this signals
-    /// that the peer as a whole is not keeping up, not that this topic is
-    /// full. See
-    /// [`Config::max_connection_queue_limit`](crate::config::Config::max_connection_queue_limit).
-    #[error("connection outbound queue full")]
-    Full,
-    /// The peer's subscription stream is closed.
-    #[error("outbound channel closed")]
-    Closed,
-}
-
 /// Queues object pieces for a remote peer subscribed to a topic.
 ///
 /// Handed to the application for every remote subscription. The pieces are
-/// written to the subscription stream the peer opened. All senders on a
-/// connection share one queue budget of
-/// [`Config::max_connection_queue_limit`](crate::config::Config::max_connection_queue_limit)
+/// written to the subscription stream the peer opened. Holds up to
+/// [`Config::max_send_queue_limit`](crate::config::Config::max_send_queue_limit)
 /// messages.
-#[derive(Debug, Clone)]
-pub struct PieceSender {
-    /// The topic's outbound channel, drained by the stream writer.
-    sender: Sender<proto::ObjectPieces>,
-    /// The connection's outbound queue limit.
-    limit: usize,
-    /// The number of messages currently queued on the connection, shared with
-    /// the other senders and the stream writers.
-    used: Arc<AtomicUsize>,
-}
-
-impl PieceSender {
-    /// Creates a sender for the outbound channel `sender` with the given
-    /// connection queue `limit`.
-    pub(crate) fn new(
-        sender: Sender<proto::ObjectPieces>,
-        limit: usize,
-        used: Arc<AtomicUsize>,
-    ) -> Self {
-        Self {
-            sender,
-            limit,
-            used,
-        }
-    }
-
-    /// Queues `pieces` for the peer.
-    ///
-    /// Returns `Full` when the connection's queue reached its limit and
-    /// `Closed` when the subscription stream is closed.
-    pub fn try_send(&self, pieces: ObjectPieces) -> Result<(), SendError> {
-        let n = self.used.fetch_add(1, Ordering::SeqCst);
-        if n >= self.limit {
-            self.used.fetch_sub(1, Ordering::SeqCst);
-            return Err(SendError::Full);
-        }
-        match self.sender.try_send(pieces.into()) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => {
-                self.used.fetch_sub(1, Ordering::SeqCst);
-                Err(SendError::Full)
-            }
-            Err(TrySendError::Closed(_)) => {
-                self.used.fetch_sub(1, Ordering::SeqCst);
-                Err(SendError::Closed)
-            }
-        }
-    }
-}
+pub type PieceSender = Sender<proto::ObjectPieces>;
 
 /// A per-topic inbound stream writer.
 ///
@@ -348,7 +279,6 @@ impl PieceSender {
 pub struct Inbound {
     topic: Vec<u8>,
     receiver: Pin<Box<Receiver<proto::ObjectPieces>>>,
-    used: Arc<AtomicUsize>,
     framed: Pin<Box<Framed<Libp2pStream, PieceCodec>>>,
     state: InboundState,
 }
@@ -357,31 +287,18 @@ impl Inbound {
     /// Creates a new `Inbound` stream writer for a topic.
     ///
     /// `receiver` is the channel with the messages to send on `topic`.
-    /// `used` is this connection's outbound queue counter, shared with the
-    /// senders. `framed` is the subscription stream the remote peer opened.
+    /// `framed` is the subscription stream the remote peer opened.
     pub(crate) fn new(
         topic: Vec<u8>,
         receiver: Receiver<proto::ObjectPieces>,
-        used: Arc<AtomicUsize>,
         framed: Framed<Libp2pStream, PieceCodec>,
     ) -> Self {
         Self {
             topic,
             receiver: Box::pin(receiver),
-            used,
             framed: Box::pin(framed),
             state: InboundState::WaitingMessage,
         }
-    }
-}
-
-impl Drop for Inbound {
-    fn drop(&mut self) {
-        // Messages left buffered in the channel were counted on push but never
-        // popped; release their budget so the connection's counter stays exact.
-        // Close the channel first so no sender pushes after the count.
-        self.receiver.close();
-        self.used.fetch_sub(self.receiver.len(), Ordering::SeqCst);
     }
 }
 
@@ -427,7 +344,6 @@ impl Future for Inbound {
             match state {
                 InboundState::WaitingMessage => match this.receiver.as_mut().poll_next(cx) {
                     Poll::Ready(Some(message)) => {
-                        this.used.fetch_sub(1, Ordering::SeqCst);
                         this.state = InboundState::WaitingReady { message };
                     }
                     // The channel is closed and drained: the local side stopped it.
