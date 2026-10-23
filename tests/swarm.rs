@@ -244,9 +244,9 @@ async fn pieces_flow_both_ways() {
     let b = Node::spawn(Config::default());
     let (a_b, b_a) = connect(&a, &b).await;
 
-    a_b.try_send(pieces(1).into()).unwrap();
+    a_b.try_send(pieces(1)).unwrap();
     assert_eq!(b.recv(a.peer_id).await, pieces(1));
-    b_a.try_send(pieces(2).into()).unwrap();
+    b_a.try_send(pieces(2)).unwrap();
     assert_eq!(a.recv(b.peer_id).await, pieces(2));
 
     a.no_event().await;
@@ -261,9 +261,9 @@ async fn pieces_from_all_peers_share_the_receiver() {
     let (_a_b, b_a) = connect(&a, &b).await;
     let (_a_c, c_a) = connect(&a, &c).await;
 
-    b_a.try_send(pieces(1).into()).unwrap();
+    b_a.try_send(pieces(1)).unwrap();
     assert_eq!(a.recv(b.peer_id).await, pieces(1));
-    c_a.try_send(pieces(2).into()).unwrap();
+    c_a.try_send(pieces(2)).unwrap();
     assert_eq!(a.recv(c.peer_id).await, pieces(2));
 }
 
@@ -281,7 +281,7 @@ async fn full_receive_queue_pauses_reading() {
     let mut full_polls = 0;
     tokio::time::timeout(TIMEOUT, async {
         while full_polls < 30 {
-            match a_b.try_send(large_pieces(sent).into()) {
+            match a_b.try_send(large_pieces(sent)) {
                 Ok(()) => {
                     sent += 1;
                     full_polls = 0;
@@ -313,10 +313,10 @@ async fn send_queue_limit() {
 
     // Nothing runs between these sends on the current-thread runtime.
     for i in 0..3 {
-        a_b.try_send(pieces(i).into()).unwrap();
+        a_b.try_send(pieces(i)).unwrap();
     }
     assert!(matches!(
-        a_b.try_send(pieces(3).into()),
+        a_b.try_send(pieces(3)),
         Err(TrySendError::Full(_))
     ));
     for i in 0..3 {
@@ -324,7 +324,7 @@ async fn send_queue_limit() {
     }
 
     // The writer made room as it drained the queue.
-    a_b.try_send(pieces(4).into()).unwrap();
+    a_b.try_send(pieces(4)).unwrap();
     assert_eq!(b.recv(a.peer_id).await, pieces(4));
 }
 
@@ -337,12 +337,12 @@ async fn dropping_receiver_unsubscribes() {
     b.unsubscribe();
     a.unsubscribed(b.peer_id).await;
     assert!(matches!(
-        a_b.try_send(pieces(0).into()),
+        a_b.try_send(pieces(0)),
         Err(TrySendError::Closed(_))
     ));
 
     // A's subscription to B is untouched.
-    b_a.try_send(pieces(1).into()).unwrap();
+    b_a.try_send(pieces(1)).unwrap();
     assert_eq!(a.recv(b.peer_id).await, pieces(1));
 }
 
@@ -359,7 +359,7 @@ async fn subscribing_again_after_dropping_receiver() {
     b.subscribe().await;
     let a_b = a.subscribed(b.peer_id).await;
     b.opened(a.peer_id).await;
-    a_b.try_send(pieces(0).into()).unwrap();
+    a_b.try_send(pieces(0)).unwrap();
     assert_eq!(b.recv(a.peer_id).await, pieces(0));
 }
 
@@ -371,7 +371,7 @@ async fn dropping_sender_ends_subscription() {
 
     // The piece fills B's receive queue, so the end of the stream waits for
     // room behind it.
-    a_b.try_send(pieces(0).into()).unwrap();
+    a_b.try_send(pieces(0)).unwrap();
     drop(a_b);
     a.unsubscribed(b.peer_id).await;
     assert_eq!(b.recv(a.peer_id).await, pieces(0));
@@ -393,11 +393,11 @@ async fn connection_close_ends_everything() {
     b.no_event().await;
 
     assert!(matches!(
-        a_b.try_send(pieces(0).into()),
+        a_b.try_send(pieces(0)),
         Err(TrySendError::Closed(_))
     ));
     assert!(matches!(
-        b_a.try_send(pieces(0).into()),
+        b_a.try_send(pieces(0)),
         Err(TrySendError::Closed(_))
     ));
 }
@@ -409,8 +409,8 @@ async fn connection_close_delivers_waiting_pieces() {
     let (a_b, _b_a) = connect(&a, &b).await;
 
     // The first piece fills B's receive queue, the second waits for room.
-    a_b.try_send(pieces(0).into()).unwrap();
-    a_b.try_send(pieces(1).into()).unwrap();
+    a_b.try_send(pieces(0)).unwrap();
+    a_b.try_send(pieces(1)).unwrap();
     tokio::time::timeout(TIMEOUT, async {
         while !b.topic().is_full() {
             tokio::time::sleep(Duration::from_millis(10)).await;

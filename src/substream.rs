@@ -29,8 +29,8 @@ use futures::{AsyncWriteExt, Sink, Stream, StreamExt, future::BoxFuture};
 use libp2p::{PeerId, Stream as Libp2pStream, swarm::ConnectionId};
 
 use crate::{
-    handler::{Delivery, TopicEvent},
-    protocol::{PieceCodec, proto},
+    handler::{Delivery, ObjectPieces, TopicEvent},
+    protocol::PieceCodec,
 };
 
 /// A per-topic outbound subscription stream.
@@ -268,7 +268,7 @@ impl Future for Outbound {
 /// written to the subscription stream the peer opened. Holds up to
 /// [`Config::max_send_queue_limit`](crate::config::Config::max_send_queue_limit)
 /// messages.
-pub type PieceSender = Sender<proto::ObjectPieces>;
+pub type PieceSender = Sender<ObjectPieces>;
 
 /// A per-topic inbound stream writer.
 ///
@@ -278,7 +278,7 @@ pub type PieceSender = Sender<proto::ObjectPieces>;
 /// every sender of the channel is dropped, or a write fails.
 pub struct Inbound {
     topic: Vec<u8>,
-    receiver: Pin<Box<Receiver<proto::ObjectPieces>>>,
+    receiver: Pin<Box<Receiver<ObjectPieces>>>,
     framed: Pin<Box<Framed<Libp2pStream, PieceCodec>>>,
     state: InboundState,
 }
@@ -290,7 +290,7 @@ impl Inbound {
     /// `framed` is the subscription stream the remote peer opened.
     pub(crate) fn new(
         topic: Vec<u8>,
-        receiver: Receiver<proto::ObjectPieces>,
+        receiver: Receiver<ObjectPieces>,
         framed: Framed<Libp2pStream, PieceCodec>,
     ) -> Self {
         Self {
@@ -306,7 +306,7 @@ enum InboundState {
     /// Waiting for the next message from the channel.
     WaitingMessage,
     /// A message was received; watching for sink readiness.
-    WaitingReady { message: proto::ObjectPieces },
+    WaitingReady { message: ObjectPieces },
     /// A message was accepted; the sink is flushing it.
     Flushing,
     /// The writer ended.
@@ -360,7 +360,7 @@ impl Future for Inbound {
                 InboundState::WaitingReady { message } => {
                     match Sink::poll_ready(this.framed.as_mut(), cx) {
                         Poll::Ready(Ok(())) => {
-                            match Sink::start_send(this.framed.as_mut(), message) {
+                            match Sink::start_send(this.framed.as_mut(), message.into()) {
                                 Ok(()) => this.state = InboundState::Flushing,
                                 Err(err) => {
                                     tracing::debug!(
